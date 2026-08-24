@@ -9,3 +9,8 @@ GET {{CMS_CSharp_HostAddress}}/health
 Accept: text/plain
 
 ###
+
+GET {{CMS_CSharp_HostAddress}}/database/status
+Accept: application/json
+
+###
