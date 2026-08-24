@@ -14,3 +14,8 @@ GET {{CMS_CSharp_HostAddress}}/database/status
 Accept: application/json
 
 ###
+
+GET {{CMS_CSharp_HostAddress}}/api/devices/search?market_name=Reno
+Accept: application/json
+
+###

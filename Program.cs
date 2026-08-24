@@ -1,7 +1,9 @@
 using System.Text.RegularExpressions;
+using CMS_CSharp.Contracts.Devices;
 using MySqlConnector;
 
 var builder = WebApplication.CreateBuilder(args);
+const string DevelopmentCorsPolicy = "DevelopmentCors";
 
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
@@ -9,6 +11,25 @@ builder.Logging.AddConsole();
 // Add services to the container.
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddHealthChecks();
+
+if (builder.Environment.IsDevelopment())
+{
+    var allowedOrigins = builder.Configuration
+        .GetSection("Cors:AllowedOrigins")
+        .Get<string[]>() ?? [];
+
+    builder.Services.AddCors(options =>
+    {
+        options.AddPolicy(DevelopmentCorsPolicy, policy =>
+        {
+            policy
+                .WithOrigins(allowedOrigins)
+                .AllowAnyHeader()
+                .AllowAnyMethod()
+                .AllowCredentials();
+        });
+    });
+}
 
 var app = builder.Build();
 
@@ -35,7 +56,11 @@ app.Use(async (context, next) =>
     }
 });
 
-if (!app.Environment.IsDevelopment())
+if (app.Environment.IsDevelopment())
+{
+    app.UseCors(DevelopmentCorsPolicy);
+}
+else
 {
     app.UseHttpsRedirection();
 }
@@ -117,6 +142,79 @@ app.MapGet("/database/status", async (IConfiguration configuration, Cancellation
 })
 .WithName("GetDatabaseConfigurationStatus");
 
+app.MapGet("/api/devices/search", async (
+    string market_name,
+    IConfiguration configuration,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(market_name))
+    {
+        return Results.BadRequest(new
+        {
+            error = "The market_name query parameter is required."
+        });
+    }
+
+    var connectionString = configuration.GetConnectionString("DefaultConnection");
+    if (string.IsNullOrWhiteSpace(connectionString))
+    {
+        return Results.Json(new
+        {
+            error = "Database connection is not configured."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
+    try
+    {
+        var devices = new List<DeviceSearchResult>();
+        var mysqlConnectionString = NormalizeMySqlConnectionString(connectionString);
+
+        await using var connection = new MySqlConnection(mysqlConnectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT
+                market_name,
+                model
+            FROM Devices
+            WHERE market_name LIKE CONCAT('%', @marketName, '%') ESCAPE '='
+              AND category IN (11, 21)
+              AND redemption_status = 0
+            ORDER BY market_name, model;
+            """;
+        command.Parameters.Add(
+            new MySqlParameter("@marketName", MySqlDbType.VarChar)
+            {
+                Value = EscapeLikePattern(market_name.Trim())
+            });
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            devices.Add(new DeviceSearchResult(
+                reader.GetString("market_name"),
+                reader.GetString("model")));
+        }
+
+        return Results.Ok(devices);
+    }
+    catch (Exception exception) when (exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(
+            "Device search failed: {ErrorMessage}",
+            exception.Message);
+
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Device search failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("SearchDevicesByMarketName");
+
 app.Run();
 
 static string NormalizeMySqlConnectionString(string connectionString)
@@ -145,3 +243,8 @@ static string NormalizeMySqlConnectionString(string connectionString)
 
     return normalized;
 }
+
+static string EscapeLikePattern(string value) => value
+    .Replace("=", "==", StringComparison.Ordinal)
+    .Replace("%", "=%", StringComparison.Ordinal)
+    .Replace("_", "=_", StringComparison.Ordinal);
