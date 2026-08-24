@@ -1,41 +1,51 @@
 var builder = WebApplication.CreateBuilder(args);
 
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole();
+
 // Add services to the container.
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
-builder.Services.AddOpenApi();
+builder.Services.AddHealthChecks();
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
-if (app.Environment.IsDevelopment())
+app.Use(async (context, next) =>
 {
-    app.MapOpenApi();
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+    try
+    {
+        await next(context);
+    }
+    finally
+    {
+        stopwatch.Stop();
+
+        app.Logger.LogInformation(
+            "HTTP {Method} {Path}{QueryString} responded {StatusCode} in {ElapsedMilliseconds} ms from {RemoteIpAddress}",
+            context.Request.Method,
+            context.Request.Path,
+            context.Request.QueryString,
+            context.Response.StatusCode,
+            stopwatch.Elapsed.TotalMilliseconds,
+            context.Connection.RemoteIpAddress);
+    }
+});
+
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHttpsRedirection();
 }
 
-app.UseHttpsRedirection();
-
-var summaries = new[]
+app.MapGet("/", (IHostEnvironment environment) => Results.Ok(new
 {
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
+    name = "OMC CMS API",
+    status = "running",
+    environment = environment.EnvironmentName,
+    utcTime = DateTimeOffset.UtcNow
+}))
+.WithName("GetApiStatus");
 
-app.MapGet("/weatherforecast", () =>
-{
-    var forecast =  Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return forecast;
-})
-.WithName("GetWeatherForecast");
+app.MapHealthChecks("/health");
 
 app.Run();
-
-record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
-{
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
-}

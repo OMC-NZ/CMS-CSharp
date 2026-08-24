@@ -1,0 +1,11 @@
+@CMS_CSharp_HostAddress = http://localhost:5089
+
+GET {{CMS_CSharp_HostAddress}}/
+Accept: application/json
+
+###
+
+GET {{CMS_CSharp_HostAddress}}/health
+Accept: text/plain
+
+###
