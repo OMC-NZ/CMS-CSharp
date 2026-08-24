@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "dgSpecHash": "PbIEVSZcSJo=",
+  "success": false,
+  "projectFilePath": "D:\\OPPO Programming\\OMC CMS\\MyApi\\MyApi.csproj",
+  "expectedPackageFiles": [],
+  "logs": [
+    {
+      "code": "NU1100",
+      "level": "Error",
+      "message": "Unable to resolve 'Microsoft.AspNetCore.OpenApi (>= 10.0.11)' for 'net10.0'.",
+      "projectPath": "D:\\OPPO Programming\\OMC CMS\\MyApi\\MyApi.csproj",
+      "filePath": "D:\\OPPO Programming\\OMC CMS\\MyApi\\MyApi.csproj",
+      "libraryId": "Microsoft.AspNetCore.OpenApi",
+      "targetGraphs": [
+        "net10.0"
+      ]
+    }
+  ]
+}
