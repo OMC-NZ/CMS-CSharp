@@ -19,3 +19,55 @@ GET {{CMS_CSharp_HostAddress}}/api/devices/search?market_name=Reno
 Accept: application/json
 
 ###
+
+GET {{CMS_CSharp_HostAddress}}/api/channels/search?name=Mobile
+Accept: application/json
+
+###
+
+GET {{CMS_CSharp_HostAddress}}/api/channels
+Accept: application/json
+
+###
+
+GET {{CMS_CSharp_HostAddress}}/api/gifts/search?name=Watch
+Accept: application/json
+
+###
+
+# The banner and optional terms file must be selected by the HTTP client.
+POST {{CMS_CSharp_HostAddress}}/api/promotions
+Content-Type: multipart/form-data; boundary=PromotionBoundary
+
+--PromotionBoundary
+Content-Disposition: form-data; name="name"
+
+OPPO Buds3 Pro for A6 5G Spark Only
+--PromotionBoundary
+Content-Disposition: form-data; name="description"
+
+one (1) x OPPO Enco Buds3 Pro White
+--PromotionBoundary
+Content-Disposition: form-data; name="products"
+
+[{"market_name":"A6 5G","model":"CPH2831"}]
+--PromotionBoundary
+Content-Disposition: form-data; name="channels"
+
+[{"code":"SPK","startDate":"2026-09-01","endDate":"2026-09-28"}]
+--PromotionBoundary
+Content-Disposition: form-data; name="gifts"
+
+[{"name":"Enco Buds3 Pro","alias":"ENCO BUDS3PRO WHITE","color":"White"}]
+--PromotionBoundary
+Content-Disposition: form-data; name="banner"; filename="banner.webp"
+Content-Type: image/webp
+
+< ./banner.webp
+--PromotionBoundary
+Content-Disposition: form-data; name="terms"
+
+/terms
+--PromotionBoundary--
+
+###

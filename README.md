@@ -1,0 +1,381 @@
+# CMS-CSharp API
+
+ASP.NET Core API for OMC CMS, backed by MySQL/MariaDB.
+
+## Local Development
+
+Start the Development environment with automatic full restarts:
+
+```powershell
+dotnet watch --no-hot-reload run --launch-profile development
+```
+
+Default URL:
+
+```text
+http://localhost:5089
+```
+
+Run with the local Production profile:
+
+```powershell
+dotnet run --launch-profile production
+```
+
+## API Endpoints
+
+### API Status
+
+```http
+GET /
+```
+
+Returns the API name, running status, environment, and server time.
+
+Success response: `200 OK`
+
+```json
+{
+  "name": "OMC CMS API",
+  "status": "running",
+  "environment": "Development",
+  "utcTime": "2026-08-25T00:00:00Z"
+}
+```
+
+### Health Check
+
+```http
+GET /health
+```
+
+Success response: `200 OK`
+
+```text
+Healthy
+```
+
+### Database Connection Status
+
+```http
+GET /database/status
+```
+
+Opens a real database connection and executes a query. It does not only check whether a connection string exists.
+
+Success response: `200 OK`
+
+```json
+{
+  "connected": true,
+  "provider": "MySql",
+  "database": "OMC_Promotions_Dev",
+  "server": "OPPONZ",
+  "version": "10.3.32-MariaDB"
+}
+```
+
+Failure response: `503 Service Unavailable`
+
+### Database Configuration
+
+`ConnectionStrings:DefaultConnection` is the single source for all MySQL connection settings, including server, port, database, user, password, and SSL options. MySqlConnector connection pooling is enabled by default, so opening and disposing connections per request reuses pooled connections efficiently.
+
+### Reusable Database Lookups
+
+Reusable lookups for reference tables are defined by `Data/Repositories/IReferenceDataRepository.cs` and implemented in `Data/Repositories/ReferenceDataRepository.cs`. Feature services receive the repository through dependency injection and pass their current MySQL connection and transaction into it. This keeps SQL out of HTTP routes, avoids duplicate lookup code, and allows several writes and lookups to participate in the same transaction.
+
+The repository currently provides:
+
+- Channel lookup by unique `code`.
+- Device-to-channel lookup by `model` and selected channel codes.
+- Gift ID lookup by unique `alias`.
+
+### Create Promotion
+
+```http
+POST /api/promotions
+Content-Type: multipart/form-data
+```
+
+Creates a promotion, uploads its files to Cloudflare R2, and inserts all related database records in one MySQL transaction.
+
+Multipart form fields:
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | Text | Yes | Promotion name. |
+| `description` | Text | Yes | Promotion description. |
+| `products` | JSON array text | Yes | Devices selected by `model`. |
+| `channels` | JSON array text | Yes | Channels selected by unique `code`; `startDate` and `endDate` use `yyyy-MM-dd` without a time component. |
+| `gifts` | JSON array text | Yes | Existing Gifts selected by unique `alias`. |
+| `banner` | File | Yes | Non-empty image file. |
+| `terms` | Text or file | Yes | Either the exact text `/terms` or one uploaded terms file, but not both. |
+
+Example JSON value for `products`:
+
+```json
+[{"model":"CPH2831"}]
+```
+
+Example JSON value for `channels`:
+
+```json
+[
+  {
+    "code": "SPK",
+    "startDate": "2026-09-01",
+    "endDate": "2026-09-28"
+  }
+]
+```
+
+Example JSON value for `gifts`:
+
+```json
+[{"alias":"ENCO BUDS3PRO WHITE"}]
+```
+
+Storage and database behavior:
+
+- The banner is renamed to a UUID while retaining a safe extension.
+- The banner is uploaded to `banners/Promotions/{uuid}.{extension}`.
+- `Promotions.banner_url` stores the renamed banner file name, not the full URL.
+- A terms file is renamed to a UUID and uploaded to `terms/Promotions/{uuid}.{extension}`.
+- For a terms file, `Promotions.terms_url` stores its public R2 URL.
+- For text terms, `Promotions.terms_url` stores `/terms`.
+- `Promotions.slug_url` is generated from the promotion name as `/promotions/{name-slug}-{unique-suffix}` and checked against existing promotion slugs before insertion.
+- The backend stores `startDate` as `start_date` at `00:00:00` and `endDate` as `end_date` at `23:59:59`.
+- `redeem_end_date` is exactly 14 calendar days after `end_date` and retains `23:59:59` (for example, an `endDate` of `2026-08-31` produces `2026-09-14 23:59:59`).
+- The promotion is inserted first so its generated ID can be used as `promotion_id` in the related tables.
+- A channel must exist by its unique `code`.
+- A product is matched only by its unique `model`. The Devices table must contain that model with at least one submitted, valid channel code. Otherwise the model is skipped and is not inserted into `Promotion_Devices.eligible_model`.
+- A valid submitted channel is inserted into `Promotion_Channels` only when at least one accepted device model is associated with that channel in the Devices table.
+- Gifts are matched only by unique `alias`; an unknown alias rejects the request with `400 Bad Request`.
+- Valid related rows are inserted into `Promotion_Devices`, `Promotion_Channels`, and `Promotion_Gifts`.
+- If database work fails, the transaction is rolled back and files uploaded by the request are removed from R2.
+
+Success response: `201 Created`
+
+```json
+{
+  "id": 123,
+  "name": "OPPO Buds3 Pro for A6 5G Spark Only",
+  "slugUrl": "/promotions/oppo-buds3-pro-for-a6-5g-spark-only-a1b2c3d4",
+  "termsUrl": "/terms",
+  "bannerFileName": "e42f7f58dd3f4de1b06573bd7b8dbb20.webp",
+  "productCount": 1,
+  "skippedProductCount": 0,
+  "channelCount": 1,
+  "skippedChannelCount": 0,
+  "giftCount": 1
+}
+```
+
+The success counts report inserted and skipped products/channels. A promotion can be created with zero related device or channel rows if none of the submitted products or channels match their source tables.
+
+Validation failure response: `400 Bad Request`
+
+Non-multipart request response: `415 Unsupported Media Type`
+
+Database or R2 failure response: `503 Service Unavailable`
+
+### Search Device Models
+
+```http
+GET /api/devices/search?market_name={market_name}
+```
+
+Query parameters:
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `market_name` | Yes | Performs a contains search against `Devices.market_name`. |
+
+Additional filters:
+
+- `category` must be `11` or `21`.
+- `redemption_status` must be `0`.
+- Duplicate results are merged by `market_name + model`.
+
+Example request:
+
+```http
+GET /api/devices/search?market_name=Tem
+```
+
+Success response: `200 OK`
+
+```json
+[
+  {
+    "market_name": "Temp",
+    "model": "CPH2689"
+  }
+]
+```
+
+Missing or empty parameter response: `400 Bad Request`
+
+Database failure response: `503 Service Unavailable`
+
+### Search Gifts
+
+```http
+GET /api/gifts/search?name={name}
+```
+
+Query parameters:
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `name` | Yes | Performs a contains search against `Gifts.name`. |
+
+Identical results are merged by `name + alias + color + status`.
+
+Example request:
+
+```http
+GET /api/gifts/search?name=Watch
+```
+
+Success response: `200 OK`
+
+```json
+[
+  {
+    "name": "OPPO Watch",
+    "alias": "Watch",
+    "color": "Black",
+    "status": 0
+  }
+]
+```
+
+Missing or empty parameter response: `400 Bad Request`
+
+Database failure response: `503 Service Unavailable`
+
+### Get Channels
+
+```http
+GET /api/channels
+```
+
+Returns all channels ordered by `code`. This endpoint does not accept search parameters.
+
+Success response: `200 OK`
+
+```json
+[
+  {
+    "code": "HVNM",
+    "name": "Harvey Norman",
+    "category": "Retailer"
+  }
+]
+```
+
+Database failure response: `503 Service Unavailable`
+
+### Search Channels
+
+```http
+GET /api/channels/search?name={name}
+```
+
+Query parameters:
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `name` | Yes | Performs a contains search against `Channels.name`. |
+
+Identical results are merged by `name + code + category`.
+
+Example request:
+
+```http
+GET /api/channels/search?name=Harvey
+```
+
+Success response: `200 OK`
+
+```json
+[
+  {
+    "name": "Harvey Norman",
+    "code": "HVNM",
+    "category": "Retailer"
+  }
+]
+```
+
+Missing or empty parameter response: `400 Bad Request`
+
+Database failure response: `503 Service Unavailable`
+
+## Development CORS
+
+The Development environment allows credentials from these frontend origins:
+
+```text
+http://localhost:3000
+```
+
+The allowed origins are configured in `appsettings.Development.json`.
+
+## Development Cloudflare R2 Configuration
+
+The Development environment defines these Cloudflare R2 configuration placeholders in `appsettings.Development.json`:
+
+| Key | Description |
+| --- | --- |
+| `R2_PUBLIC_ASSETS_URL` | Public base URL used to access uploaded assets. |
+| `R2_ENDPOINT` | Cloudflare R2 S3-compatible endpoint. |
+| `R2_BUCKET` | R2 bucket name. |
+| `R2_ACCESS_KEY_ID` | R2 access key ID. |
+| `R2_SECRET_ACCESS_KEY` | R2 secret access key. |
+| `R2_UPLOAD_MAX_BYTES` | Maximum allowed upload size in bytes. |
+
+Keep secret values out of committed configuration. Set real local values through environment variables when possible. PowerShell example:
+
+```powershell
+$env:R2_PUBLIC_ASSETS_URL="https://assets.example.com"
+$env:R2_ENDPOINT="https://account-id.r2.cloudflarestorage.com"
+$env:R2_BUCKET="bucket-name"
+$env:R2_ACCESS_KEY_ID="access-key-id"
+$env:R2_SECRET_ACCESS_KEY="secret-access-key"
+$env:R2_UPLOAD_MAX_BYTES="10485760"
+```
+
+### Internal R2 Upload Service
+
+`IR2StorageService` is an internal service registered as a singleton dependency. It can only be injected into application services inside this project and is not exposed as a general-purpose HTTP upload endpoint. It validates the R2 configuration, rejects files larger than `R2_UPLOAD_MAX_BYTES`, uploads through the R2 S3-compatible API, supports cleanup deletion, and returns the object key, public URL, ETag, and uploaded size. Upload requests disable the AWS SDK streaming SigV4 payload/trailer format and default SDK checksum trailer because Cloudflare R2 does not support that upload format.
+
+Example usage:
+
+```csharp
+internal sealed class AssetService(IR2StorageService storage)
+{
+    internal Task<R2UploadResult> UploadAsync(
+        Stream content,
+        string fileName,
+        string contentType,
+        CancellationToken cancellationToken)
+    {
+        var objectKey = $"assets/{Guid.NewGuid():N}-{fileName}";
+
+        return storage.UploadAsync(
+            content,
+            objectKey,
+            contentType,
+            cancellationToken);
+    }
+}
+```
+
+The upload service does not close streams supplied by the caller. No public upload API endpoint is currently exposed.
+
+## API Documentation Maintenance Rule
+
+Every API addition, modification, rename, or deletion must update this README in the same change. Keep the endpoint list, request parameters, filtering rules, response formats, examples, and HTTP status codes synchronized with the implementation.

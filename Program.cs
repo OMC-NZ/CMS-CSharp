@@ -1,5 +1,11 @@
 using System.Text.RegularExpressions;
+using System.Text.Json;
+using CMS_CSharp.Contracts.Channels;
 using CMS_CSharp.Contracts.Devices;
+using CMS_CSharp.Contracts.Gifts;
+using CMS_CSharp.Data.Repositories;
+using CMS_CSharp.Features.Promotions;
+using CMS_CSharp.Services.Storage;
 using MySqlConnector;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -11,6 +17,9 @@ builder.Logging.AddConsole();
 // Add services to the container.
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddHealthChecks();
+builder.Services.AddSingleton<IR2StorageService, R2StorageService>();
+builder.Services.AddScoped<IReferenceDataRepository, ReferenceDataRepository>();
+builder.Services.AddScoped<PromotionCreationService>();
 
 if (builder.Environment.IsDevelopment())
 {
@@ -78,7 +87,6 @@ app.MapHealthChecks("/health");
 
 app.MapGet("/database/status", async (IConfiguration configuration, CancellationToken cancellationToken) =>
 {
-    var provider = configuration["Database:Provider"];
     var connectionString = configuration.GetConnectionString("DefaultConnection");
 
     if (string.IsNullOrWhiteSpace(connectionString))
@@ -92,15 +100,6 @@ app.MapGet("/database/status", async (IConfiguration configuration, Cancellation
 
     try
     {
-        if (!string.Equals(provider, "MySql", StringComparison.OrdinalIgnoreCase))
-        {
-            return Results.Json(new
-            {
-                connected = false,
-                error = $"Unsupported database provider: {provider}"
-            }, statusCode: StatusCodes.Status503ServiceUnavailable);
-        }
-
         var mysqlConnectionString = NormalizeMySqlConnectionString(connectionString);
         await using var connection = new MySqlConnection(mysqlConnectionString);
         await connection.OpenAsync(cancellationToken);
@@ -119,7 +118,7 @@ app.MapGet("/database/status", async (IConfiguration configuration, Cancellation
         return Results.Ok(new
         {
             connected = true,
-            provider,
+            provider = "MySql",
             database = reader.GetString(0),
             server = reader.IsDBNull(1) ? null : reader.GetString(1),
             version = reader.IsDBNull(2) ? null : reader.GetString(2)
@@ -215,7 +214,291 @@ app.MapGet("/api/devices/search", async (
 })
 .WithName("SearchDevicesByMarketName");
 
+app.MapGet("/api/channels/search", async (
+    string name,
+    IConfiguration configuration,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(name))
+    {
+        return Results.BadRequest(new
+        {
+            error = "The name query parameter is required."
+        });
+    }
+
+    var connectionString = configuration.GetConnectionString("DefaultConnection");
+    if (string.IsNullOrWhiteSpace(connectionString))
+    {
+        return Results.Json(new
+        {
+            error = "Database connection is not configured."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
+    try
+    {
+        var channels = new List<ChannelSearchResult>();
+        var mysqlConnectionString = NormalizeMySqlConnectionString(connectionString);
+
+        await using var connection = new MySqlConnection(mysqlConnectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT
+                name,
+                code,
+                category
+            FROM Channels
+            WHERE name LIKE CONCAT('%', @name, '%') ESCAPE '='
+            ORDER BY name, code, category;
+            """;
+        command.Parameters.Add(
+            new MySqlParameter("@name", MySqlDbType.VarChar)
+            {
+                Value = EscapeLikePattern(name.Trim())
+            });
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            channels.Add(new ChannelSearchResult(
+                reader.GetString("name"),
+                reader.GetString("code"),
+                reader.GetString("category")));
+        }
+
+        return Results.Ok(channels);
+    }
+    catch (Exception exception) when (exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(
+            "Channel search failed: {ErrorMessage}",
+            exception.Message);
+
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Channel search failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("SearchChannelsByName");
+
+app.MapGet("/api/channels", async (
+    IConfiguration configuration,
+    CancellationToken cancellationToken) =>
+{
+    var connectionString = configuration.GetConnectionString("DefaultConnection");
+    if (string.IsNullOrWhiteSpace(connectionString))
+    {
+        return Results.Json(new
+        {
+            error = "Database connection is not configured."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
+    try
+    {
+        var channels = new List<ChannelListResult>();
+        var mysqlConnectionString = NormalizeMySqlConnectionString(connectionString);
+
+        await using var connection = new MySqlConnection(mysqlConnectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                code,
+                name,
+                category
+            FROM Channels
+            ORDER BY code;
+            """;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            channels.Add(new ChannelListResult(
+                reader.GetString("code"),
+                reader.GetString("name"),
+                reader.GetString("category")));
+        }
+
+        return Results.Ok(channels);
+    }
+    catch (Exception exception) when (exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(
+            "Get channels failed: {ErrorMessage}",
+            exception.Message);
+
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Getting channels failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("GetChannels");
+
+app.MapGet("/api/gifts/search", async (
+    string name,
+    IConfiguration configuration,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(name))
+    {
+        return Results.BadRequest(new
+        {
+            error = "The name query parameter is required."
+        });
+    }
+
+    var connectionString = configuration.GetConnectionString("DefaultConnection");
+    if (string.IsNullOrWhiteSpace(connectionString))
+    {
+        return Results.Json(new
+        {
+            error = "Database connection is not configured."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
+    try
+    {
+        var gifts = new List<GiftSearchResult>();
+        var mysqlConnectionString = NormalizeMySqlConnectionString(connectionString);
+
+        await using var connection = new MySqlConnection(mysqlConnectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT
+                name,
+                alias,
+                color,
+                status
+            FROM Gifts
+            WHERE name LIKE CONCAT('%', @name, '%') ESCAPE '='
+            ORDER BY name, alias, color, status;
+            """;
+        command.Parameters.Add(
+            new MySqlParameter("@name", MySqlDbType.VarChar)
+            {
+                Value = EscapeLikePattern(name.Trim())
+            });
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            gifts.Add(new GiftSearchResult(
+                reader.GetString("name"),
+                reader.GetString("alias"),
+                reader.GetString("color"),
+                reader.GetSByte("status")));
+        }
+
+        return Results.Ok(gifts);
+    }
+    catch (Exception exception) when (exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(
+            "Gift search failed: {ErrorMessage}",
+            exception.Message);
+
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Gift search failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("SearchGiftsByName");
+
+app.MapPost("/api/promotions", async (
+    HttpRequest httpRequest,
+    PromotionCreationService promotionCreationService,
+    CancellationToken cancellationToken) =>
+{
+    if (!httpRequest.HasFormContentType)
+    {
+        return Results.Json(new
+        {
+            error = "Content-Type must be multipart/form-data."
+        }, statusCode: StatusCodes.Status415UnsupportedMediaType);
+    }
+
+    try
+    {
+        var form = await httpRequest.ReadFormAsync(cancellationToken);
+        var banner = form.Files.GetFile("banner");
+        if (banner is null)
+        {
+            throw new PromotionValidationException("The banner file is required.");
+        }
+
+        var command = new CreatePromotionCommand(
+            form["name"].ToString(),
+            form["description"].ToString(),
+            DeserializeRequiredList<PromotionProductInput>(form, "products"),
+            DeserializeRequiredList<PromotionChannelInput>(form, "channels"),
+            DeserializeRequiredList<PromotionGiftInput>(form, "gifts"),
+            form["terms"].FirstOrDefault(),
+            form.Files.GetFile("terms"),
+            banner);
+
+        var result = await promotionCreationService.CreateAsync(
+            command,
+            cancellationToken);
+
+        return Results.Created($"/api/promotions/{result.Id}", result);
+    }
+    catch (Exception exception) when (
+        exception is PromotionValidationException or JsonException)
+    {
+        return Results.BadRequest(new
+        {
+            error = exception.Message
+        });
+    }
+    catch (Exception exception)
+    {
+        app.Logger.LogError(exception, "Promotion creation failed.");
+
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Promotion creation failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("CreatePromotion");
+
 app.Run();
+
+static IReadOnlyList<T> DeserializeRequiredList<T>(
+    IFormCollection form,
+    string fieldName)
+{
+    var json = form[fieldName].ToString();
+    if (string.IsNullOrWhiteSpace(json))
+    {
+        throw new PromotionValidationException(
+            $"The {fieldName} form field is required.");
+    }
+
+    return JsonSerializer.Deserialize<List<T>>(
+        json,
+        new JsonSerializerOptions(JsonSerializerDefaults.Web))
+        ?? throw new PromotionValidationException(
+            $"The {fieldName} form field must be a JSON array.");
+}
 
 static string NormalizeMySqlConnectionString(string connectionString)
 {
