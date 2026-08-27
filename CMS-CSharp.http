@@ -5,6 +5,80 @@ Accept: application/json
 
 ###
 
+GET {{CMS_CSharp_HostAddress}}/api/promotions/eligible?imei=123456789012345
+Accept: application/json
+
+###
+
+POST {{CMS_CSharp_HostAddress}}/api/claims
+Content-Type: multipart/form-data; boundary=ClaimBoundary
+
+--ClaimBoundary
+Content-Disposition: form-data; name="promotionId"
+
+1
+--ClaimBoundary
+Content-Disposition: form-data; name="imei"
+
+123456789012345
+--ClaimBoundary
+Content-Disposition: form-data; name="purchaseDate"
+
+2026-08-25
+--ClaimBoundary
+Content-Disposition: form-data; name="firstName"
+
+Example
+--ClaimBoundary
+Content-Disposition: form-data; name="lastName"
+
+Customer
+--ClaimBoundary
+Content-Disposition: form-data; name="email"
+
+customer@example.com
+--ClaimBoundary
+Content-Disposition: form-data; name="contact"
+
+0210000000
+--ClaimBoundary
+Content-Disposition: form-data; name="street"
+
+1 Example Street
+--ClaimBoundary
+Content-Disposition: form-data; name="suburb"
+
+Example Suburb
+--ClaimBoundary
+Content-Disposition: form-data; name="city"
+
+Auckland
+--ClaimBoundary
+Content-Disposition: form-data; name="postcode"
+
+1010
+--ClaimBoundary
+Content-Disposition: form-data; name="instructions"
+
+Leave at reception
+--ClaimBoundary
+Content-Disposition: form-data; name="giftAliases"
+
+["GIFT-ALIAS"]
+--ClaimBoundary
+Content-Disposition: form-data; name="receipt"; filename="receipt.pdf"
+Content-Type: application/pdf
+
+< ./receipt.pdf
+--ClaimBoundary
+Content-Disposition: form-data; name="screenshot"; filename="screenshot.png"
+Content-Type: image/png
+
+< ./screenshot.png
+--ClaimBoundary--
+
+###
+
 GET {{CMS_CSharp_HostAddress}}/health
 Accept: text/plain
 

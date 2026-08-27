@@ -4,7 +4,9 @@ using CMS_CSharp.Contracts.Channels;
 using CMS_CSharp.Contracts.Devices;
 using CMS_CSharp.Contracts.Gifts;
 using CMS_CSharp.Data.Repositories;
+using CMS_CSharp.Features.Claims;
 using CMS_CSharp.Features.Promotions;
+using CMS_CSharp.Features.Promotions.DuplicateDetection;
 using CMS_CSharp.Services.Storage;
 using MySqlConnector;
 
@@ -19,7 +21,10 @@ builder.Logging.AddConsole();
 builder.Services.AddHealthChecks();
 builder.Services.AddSingleton<IR2StorageService, R2StorageService>();
 builder.Services.AddScoped<IReferenceDataRepository, ReferenceDataRepository>();
+builder.Services.AddScoped<PromotionConflictDetector>();
 builder.Services.AddScoped<PromotionCreationService>();
+builder.Services.AddScoped<EligiblePromotionLookupService>();
+builder.Services.AddScoped<ClaimCreationService>();
 
 if (builder.Environment.IsDevelopment())
 {
@@ -458,6 +463,20 @@ app.MapPost("/api/promotions", async (
 
         return Results.Created($"/api/promotions/{result.Id}", result);
     }
+    catch (PromotionConflictException exception)
+    {
+        return Results.Conflict(new
+        {
+            error = exception.Message,
+            existingPromotion = new
+            {
+                id = exception.Conflict.PromotionId,
+                name = exception.Conflict.Name,
+                slugUrl = exception.Conflict.SlugUrl
+            },
+            overlappingChannelCodes = exception.Conflict.OverlappingChannelCodes
+        });
+    }
     catch (Exception exception) when (
         exception is PromotionValidationException or JsonException)
     {
@@ -479,6 +498,111 @@ app.MapPost("/api/promotions", async (
     }
 })
 .WithName("CreatePromotion");
+
+app.MapGet("/api/promotions/eligible", async (
+    string? imei,
+    EligiblePromotionLookupService lookupService,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(imei))
+    {
+        return Results.BadRequest(new { error = "The imei query parameter is required." });
+    }
+
+    try
+    {
+        var result = await lookupService.FindByImeiAsync(imei, cancellationToken);
+        return result is null
+            ? Results.NotFound(new { error = $"Device IMEI '{imei.Trim()}' was not found." })
+            : Results.Ok(result);
+    }
+    catch (PromotionValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception)
+    {
+        app.Logger.LogError(exception, "Eligible promotion lookup failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Eligible promotion lookup failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("GetEligiblePromotionsByImei");
+
+app.MapPost("/api/claims", async (
+    HttpRequest httpRequest,
+    ClaimCreationService claimCreationService,
+    CancellationToken cancellationToken) =>
+{
+    if (!httpRequest.HasFormContentType)
+    {
+        return Results.Json(new
+        {
+            error = "Content-Type must be multipart/form-data."
+        }, statusCode: StatusCodes.Status415UnsupportedMediaType);
+    }
+
+    try
+    {
+        var form = await httpRequest.ReadFormAsync(cancellationToken);
+        var receipt = form.Files.GetFile("receipt");
+        var screenshot = form.Files.GetFile("screenshot");
+        if (receipt is null || screenshot is null)
+        {
+            throw new ClaimValidationException(
+                "The receipt and screenshot files are required.");
+        }
+
+        if (!int.TryParse(form["promotionId"], out var promotionId))
+        {
+            throw new ClaimValidationException("promotionId must be a valid integer.");
+        }
+
+        var command = new CreateClaimCommand(
+            promotionId,
+            form["imei"].ToString(),
+            form["purchaseDate"].ToString(),
+            form["firstName"].ToString(),
+            form["lastName"].ToString(),
+            form["email"].ToString(),
+            form["contact"].ToString(),
+            form["street"].ToString(),
+            form["suburb"].ToString(),
+            form["city"].ToString(),
+            form["postcode"].ToString(),
+            form["instructions"].FirstOrDefault(),
+            DeserializeRequiredList<string>(form, "giftAliases"),
+            receipt,
+            screenshot);
+
+        var result = await claimCreationService.CreateAsync(command, cancellationToken);
+        return Results.Created($"/api/claims/{result.Id}", result);
+    }
+    catch (ClaimConflictException exception)
+    {
+        return Results.Conflict(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is ClaimValidationException or JsonException)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception)
+    {
+        app.Logger.LogError(exception, "Claim creation failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Claim creation failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("CreateClaim");
 
 app.Run();
 

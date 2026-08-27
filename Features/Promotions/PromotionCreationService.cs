@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.RegularExpressions;
 using CMS_CSharp.Data.Repositories;
+using CMS_CSharp.Features.Promotions.DuplicateDetection;
 using CMS_CSharp.Services.Storage;
 using MySqlConnector;
 
@@ -10,6 +11,7 @@ internal sealed partial class PromotionCreationService(
     IConfiguration configuration,
     IR2StorageService r2Storage,
     IReferenceDataRepository referenceData,
+    PromotionConflictDetector conflictDetector,
     ILogger<PromotionCreationService> logger)
 {
     public async Task<CreatePromotionResult> CreateAsync(
@@ -90,6 +92,126 @@ internal sealed partial class PromotionCreationService(
 
         try
         {
+            var products = request.Products
+                .Select(product => product.Model.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var channels = request.Channels
+                .DistinctBy(channel => channel.Code.Trim(), StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var validChannels = new List<PromotionChannelInput>();
+            foreach (var channel in channels)
+            {
+                if (await referenceData.ChannelExistsByCodeAsync(
+                    connection,
+                    transaction,
+                    channel.Code,
+                    cancellationToken))
+                {
+                    validChannels.Add(channel);
+                }
+                else
+                {
+                    logger.LogWarning(
+                        "Skipping unmatched promotion channel code {Code}.",
+                        channel.Code);
+                }
+            }
+
+            var validChannelCodes = validChannels
+                .Select(channel => channel.Code.Trim())
+                .ToArray();
+            var matchedChannelCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var validModels = new List<string>();
+            foreach (var model in products)
+            {
+                var productChannelCodes = await referenceData.GetDeviceChannelCodesByModelAsync(
+                    connection,
+                    transaction,
+                    model,
+                    validChannelCodes,
+                    cancellationToken);
+                if (productChannelCodes.Count == 0)
+                {
+                    logger.LogWarning(
+                        "Skipping promotion device model {Model}; it does not match any selected channel.",
+                        model);
+                    continue;
+                }
+
+                validModels.Add(model);
+                matchedChannelCodes.UnionWith(productChannelCodes);
+            }
+
+            var effectiveChannels = new List<PromotionChannelPeriod>();
+            foreach (var channel in validChannels)
+            {
+                if (!matchedChannelCodes.Contains(channel.Code.Trim()))
+                {
+                    logger.LogWarning(
+                        "Skipping promotion channel code {Code}; no submitted device model matches it.",
+                        channel.Code);
+                    continue;
+                }
+
+                var startDate = ParseDate(
+                    channel.StartDate,
+                    "channel startDate",
+                    endOfDay: false);
+                var endDate = ParseDate(
+                    channel.EndDate,
+                    "channel endDate",
+                    endOfDay: true);
+
+                if (endDate < startDate)
+                {
+                    throw new PromotionValidationException(
+                        $"Channel '{channel.Code}' end date must not be earlier than its start date.");
+                }
+
+                effectiveChannels.Add(new PromotionChannelPeriod(
+                    channel.Code.Trim(),
+                    startDate,
+                    endDate));
+            }
+
+            var gifts = request.Gifts
+                .Select(gift => gift.Alias.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var giftIds = new List<int>();
+            foreach (var giftAlias in gifts)
+            {
+                var giftId = await referenceData.FindGiftIdByAliasAsync(
+                    connection,
+                    transaction,
+                    giftAlias,
+                    cancellationToken);
+                if (giftId is null)
+                {
+                    throw new PromotionValidationException(
+                        $"Gift alias '{giftAlias}' does not exist.");
+                }
+
+                giftIds.Add(giftId.Value);
+            }
+
+            var comparisonData = new PromotionComparisonData(
+                validModels.Order(StringComparer.OrdinalIgnoreCase).ToArray(),
+                effectiveChannels
+                    .OrderBy(channel => channel.Code, StringComparer.OrdinalIgnoreCase)
+                    .ToArray(),
+                giftIds.Distinct().Order().ToArray());
+            var conflict = await conflictDetector.FindConflictAsync(
+                connection,
+                transaction,
+                comparisonData,
+                cancellationToken);
+            if (conflict is not null)
+            {
+                throw new PromotionConflictException(conflict);
+            }
+
             var slugUrl = await CreateUniqueSlugUrlAsync(
                 connection,
                 transaction,
@@ -116,52 +238,8 @@ internal sealed partial class PromotionCreationService(
 
             var promotionId = promotionCommand.LastInsertedId;
 
-            var products = request.Products
-                .DistinctBy(product => product.Model, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            var channels = request.Channels
-                .DistinctBy(channel => channel.Code, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            var validChannels = new List<PromotionChannelInput>();
-            foreach (var channel in channels)
+            foreach (var model in validModels)
             {
-                if (await referenceData.ChannelExistsByCodeAsync(
-                    connection,
-                    transaction,
-                    channel.Code,
-                    cancellationToken))
-                {
-                    validChannels.Add(channel);
-                }
-                else
-                {
-                    logger.LogWarning(
-                        "Skipping unmatched promotion channel code {Code}.",
-                        channel.Code);
-                }
-            }
-
-            var validChannelCodes = validChannels
-                .Select(channel => channel.Code.Trim())
-                .ToArray();
-            var matchedChannelCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var insertedProductCount = 0;
-            foreach (var product in products)
-            {
-                var productChannelCodes = await referenceData.GetDeviceChannelCodesByModelAsync(
-                    connection,
-                    transaction,
-                    product.Model,
-                    validChannelCodes,
-                    cancellationToken);
-                if (productChannelCodes.Count == 0)
-                {
-                    logger.LogWarning(
-                        "Skipping promotion device model {Model}; it does not match any selected channel.",
-                        product.Model);
-                    continue;
-                }
-
                 await ExecuteAsync(
                     connection,
                     transaction,
@@ -171,37 +249,11 @@ internal sealed partial class PromotionCreationService(
                     """,
                     cancellationToken,
                     ("@promotionId", promotionId),
-                    ("@model", product.Model.Trim()));
-                insertedProductCount++;
-                matchedChannelCodes.UnionWith(productChannelCodes);
+                    ("@model", model));
             }
 
-            var insertedChannelCount = 0;
-            foreach (var channel in validChannels)
+            foreach (var channel in effectiveChannels)
             {
-                if (!matchedChannelCodes.Contains(channel.Code.Trim()))
-                {
-                    logger.LogWarning(
-                        "Skipping promotion channel code {Code}; no submitted device model matches it.",
-                        channel.Code);
-                    continue;
-                }
-
-                var startDate = ParseDate(
-                    channel.StartDate,
-                    "channel startDate",
-                    endOfDay: false);
-                var endDate = ParseDate(
-                    channel.EndDate,
-                    "channel endDate",
-                    endOfDay: true);
-
-                if (endDate < startDate)
-                {
-                    throw new PromotionValidationException(
-                        $"Channel '{channel.Code}' end date must not be earlier than its start date.");
-                }
-
                 await ExecuteAsync(
                     connection,
                     transaction,
@@ -213,30 +265,15 @@ internal sealed partial class PromotionCreationService(
                     """,
                     cancellationToken,
                     ("@promotionId", promotionId),
-                    ("@channelCode", channel.Code.Trim()),
-                    ("@startDate", startDate),
-                    ("@endDate", endDate),
-                    ("@redeemEndDate", endDate.AddDays(14)),
+                    ("@channelCode", channel.Code),
+                    ("@startDate", channel.StartDate),
+                    ("@endDate", channel.EndDate),
+                    ("@redeemEndDate", channel.EndDate.AddDays(14)),
                     ("@updatedAt", updatedAt));
-                insertedChannelCount++;
             }
 
-            var gifts = request.Gifts
-                .DistinctBy(gift => gift.Alias, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            foreach (var gift in gifts)
+            foreach (var giftId in giftIds.Distinct())
             {
-                var giftId = await referenceData.FindGiftIdByAliasAsync(
-                    connection,
-                    transaction,
-                    gift.Alias,
-                    cancellationToken);
-                if (giftId is null)
-                {
-                    throw new PromotionValidationException(
-                        $"Gift alias '{gift.Alias}' does not exist.");
-                }
-
                 await ExecuteAsync(
                     connection,
                     transaction,
@@ -246,7 +283,7 @@ internal sealed partial class PromotionCreationService(
                     """,
                     cancellationToken,
                     ("@promotionId", promotionId),
-                    ("@giftId", giftId.Value));
+                    ("@giftId", giftId));
             }
 
             await transaction.CommitAsync(cancellationToken);
@@ -257,11 +294,11 @@ internal sealed partial class PromotionCreationService(
                 slugUrl,
                 termsUrl,
                 bannerFileName,
-                insertedProductCount,
-                products.Length - insertedProductCount,
-                insertedChannelCount,
-                channels.Length - insertedChannelCount,
-                gifts.Length);
+                validModels.Count,
+                products.Length - validModels.Count,
+                effectiveChannels.Count,
+                channels.Length - effectiveChannels.Count,
+                giftIds.Distinct().Count());
         }
         catch
         {

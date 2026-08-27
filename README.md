@@ -91,6 +91,53 @@ The repository currently provides:
 - Device-to-channel lookup by `model` and selected channel codes.
 - Gift ID lookup by unique `alias`.
 
+### Get Eligible Promotions by IMEI
+
+```http
+GET /api/promotions/eligible?imei={imei}
+```
+
+Finds a Device by its exact 15-digit IMEI and uses the Device `model` and `channel_code` to find applicable Promotions.
+
+Query parameters:
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `imei` | Yes | Exact 15-digit value from `Devices.imei`. |
+
+Matching rules:
+
+- `Promotion_Devices.eligible_model` must match the Device model.
+- `Promotion_Channels.channel_code` must match the Device channel code.
+- Channel `start_date`, `end_date`, and `redeem_end_date` are intentionally not checked by this endpoint.
+- Device category and redemption status are not used as filters.
+- `Promotions.banner_url` is treated as the stored banner filename and expanded to `{R2_PUBLIC_ASSETS_URL}/banners/Promotions/{banner-file}`. An already absolute banner URL is returned unchanged.
+- The response returns the public image URL; it does not proxy the image binary through this API.
+- Device model, channel code, Promotion description, and Gifts are used or resolved internally as needed but are not included in the response. The queried IMEI is included in the response.
+
+Success response: `200 OK`
+
+```json
+{
+  "imei": "123456789012345",
+  "promotions": [
+    {
+      "id": 123,
+      "name": "Example Promotion",
+      "bannerUrl": "https://assets.example.com/banners/Promotions/banner-uuid.webp"
+    }
+  ]
+}
+```
+
+An existing Device with no applicable Promotions returns `200 OK` with an empty `promotions` array.
+
+Invalid or missing IMEI response: `400 Bad Request`
+
+Unknown IMEI response: `404 Not Found`
+
+Database or configuration failure response: `503 Service Unavailable`
+
 ### Create Promotion
 
 ```http
@@ -147,11 +194,12 @@ Storage and database behavior:
 - `Promotions.slug_url` is generated from the promotion name as `/promotions/{name-slug}-{unique-suffix}` and checked against existing promotion slugs before insertion.
 - The backend stores `startDate` as `start_date` at `00:00:00` and `endDate` as `end_date` at `23:59:59`.
 - `redeem_end_date` is exactly 14 calendar days after `end_date` and retains `23:59:59` (for example, an `endDate` of `2026-08-31` produces `2026-09-14 23:59:59`).
-- The promotion is inserted first so its generated ID can be used as `promotion_id` in the related tables.
+- The backend resolves the effective models, channels, channel periods, and gift IDs before inserting the promotion. It runs the reusable conflict detector against existing promotions, then inserts `Promotions` first and uses its generated ID for the related rows.
 - A channel must exist by its unique `code`.
 - A product is matched only by its unique `model`. The Devices table must contain that model with at least one submitted, valid channel code. Otherwise the model is skipped and is not inserted into `Promotion_Devices.eligible_model`.
 - A valid submitted channel is inserted into `Promotion_Channels` only when at least one accepted device model is associated with that channel in the Devices table.
 - Gifts are matched only by unique `alias`; an unknown alias rejects the request with `400 Bad Request`.
+- A conflict exists when an existing promotion has exactly the same effective model set, channel-code set, and gift-ID set, and at least one matching channel period overlaps inclusively. Periods overlap when `newStart <= existingEnd` and `newEnd >= existingStart`. An end date followed by the next calendar day's start date is allowed; using the same calendar date is an overlap.
 - Valid related rows are inserted into `Promotion_Devices`, `Promotion_Channels`, and `Promotion_Gifts`.
 - If database work fails, the transaction is rolled back and files uploaded by the request are removed from R2.
 
@@ -175,6 +223,93 @@ Success response: `201 Created`
 The success counts report inserted and skipped products/channels. A promotion can be created with zero related device or channel rows if none of the submitted products or channels match their source tables.
 
 Validation failure response: `400 Bad Request`
+
+Duplicate or overlapping promotion response: `409 Conflict`
+
+```json
+{
+  "error": "A promotion with the same models, channels, and gifts has an overlapping channel period.",
+  "existingPromotion": {
+    "id": 122,
+    "name": "Existing promotion",
+    "slugUrl": "/promotions/existing-promotion-a1b2c3d4"
+  },
+  "overlappingChannelCodes": ["SPK"]
+}
+```
+
+Non-multipart request response: `415 Unsupported Media Type`
+
+Database or R2 failure response: `503 Service Unavailable`
+
+### Create Claim
+
+```http
+POST /api/claims
+Content-Type: multipart/form-data
+```
+
+Creates a customer and claim, records its gifts and delivery address, uploads the receipt and screenshot to Cloudflare R2, and marks the claimed device as redeemed in one database transaction.
+
+Multipart form fields:
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `promotionId` | Integer | Yes | ID of the selected existing Promotion. The backend reads its name for the R2 folder. |
+| `imei` | Text | Yes | A 15-character Device IMEI. |
+| `purchaseDate` | Text | Yes | Purchase date in `yyyy-MM-dd` format. |
+| `firstName` | Text | Yes | Customer first name. |
+| `lastName` | Text | Yes | Customer last name. |
+| `email` | Text | Yes | Customer email address. |
+| `contact` | Text | Yes | Customer contact number. |
+| `street` | Text | Yes | Delivery street. |
+| `suburb` | Text | Yes | Delivery suburb. |
+| `city` | Text | Yes | Delivery city. |
+| `postcode` | Text | Yes | Delivery postcode. |
+| `instructions` | Text | No | Optional delivery instructions. |
+| `giftAliases` | JSON array text | Yes | One or more unique Gift aliases selected from the Promotion. |
+| `receipt` | File | Yes | Non-empty receipt file. |
+| `screenshot` | File | Yes | Non-empty screenshot file. |
+
+Example `giftAliases` value:
+
+```json
+["ENCO BUDS3PRO WHITE"]
+```
+
+Validation and persistence rules:
+
+- The Promotion must exist.
+- The IMEI must exist in `Devices`, must not already be redeemed, and its model must exist in `Promotion_Devices` for the selected Promotion.
+- The Device channel must exist in `Promotion_Channels`, and `purchaseDate` must be within that channel's `start_date` and `end_date`.
+- Every Gift alias is resolved to `Gifts.id` and must exist in `Promotion_Gifts` for the selected Promotion.
+- A new `Customers` row is inserted first and its generated ID is stored in `Claims.customer_id`.
+- The Claim ID format is `OPNZPROCLM-yyMMdd-XXXXXXXX`, using the current `Pacific/Auckland` date. The final eight characters are cryptographically generated uppercase letters or digits, and the generated ID is checked against `Claims.id` before use.
+- Receipt and screenshot files are independently renamed to UUID filenames while retaining safe extensions.
+- Both files are uploaded under `claims/promotions/{promotion-name}/{uuid}.{extension}`. Slash characters and control characters in the Promotion name are replaced with `-` for a safe R2 object key.
+- `Claims.receipt_url` and `Claims.screenshot_url` store the corresponding public R2 URLs.
+- `Claims.status` and `Claims.email_status` initially use `0`.
+- Selected Gifts are inserted into `Claim_Gifts`, and the delivery address is inserted into the existing `Deliver_Addresses` table with `is_current = 1`.
+- After all Claim records are prepared, `Devices.redemption_status` is changed from `0` to `1` in the same transaction.
+- If any database operation fails, the transaction is rolled back and files uploaded by the request are removed from R2.
+
+Success response: `201 Created`
+
+```json
+{
+  "id": "OPNZPROCLM-260827-4EUZB66Y",
+  "promotionId": 123,
+  "customerId": 456,
+  "imei": "123456789012345",
+  "giftIds": [12],
+  "receiptUrl": "https://assets.example.com/claims/promotions/Example%20Promotion/uuid.pdf",
+  "screenshotUrl": "https://assets.example.com/claims/promotions/Example%20Promotion/uuid.png"
+}
+```
+
+Validation failure response: `400 Bad Request`
+
+Already redeemed or concurrently claimed Device response: `409 Conflict`
 
 Non-multipart request response: `415 Unsupported Media Type`
 
@@ -232,6 +367,12 @@ Query parameters:
 | `name` | Yes | Performs a contains search against `Gifts.name`. |
 
 Identical results are merged by `name + alias + color + status`.
+
+Gift status values:
+
+- `0`: Available and active.
+- `1`: No longer offered and should not be selected for new claims.
+- `2`: Temporarily out of stock.
 
 Example request:
 
