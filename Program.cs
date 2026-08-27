@@ -582,10 +582,6 @@ app.MapPost("/api/claims", async (
         var result = await claimCreationService.CreateAsync(command, cancellationToken);
         return Results.Created($"/api/claims/{result.Id}", result);
     }
-    catch (ClaimConflictException exception)
-    {
-        return Results.Conflict(new { error = exception.Message });
-    }
     catch (Exception exception) when (
         exception is ClaimValidationException or JsonException)
     {

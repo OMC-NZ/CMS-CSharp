@@ -5,7 +5,7 @@ Accept: application/json
 
 ###
 
-GET {{CMS_CSharp_HostAddress}}/api/promotions/eligible?imei=123456789012345
+GET {{CMS_CSharp_HostAddress}}/api/promotions/eligible?imei=490154203237518
 Accept: application/json
 
 ###
@@ -20,7 +20,7 @@ Content-Disposition: form-data; name="promotionId"
 --ClaimBoundary
 Content-Disposition: form-data; name="imei"
 
-123456789012345
+490154203237518
 --ClaimBoundary
 Content-Disposition: form-data; name="purchaseDate"
 

@@ -59,16 +59,20 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
 
         await using var promotionCommand = new MySqlCommand(
             """
-            SELECT DISTINCT
+            SELECT
                 p.id,
                 p.name,
-                p.banner_url
+                p.banner_url,
+                MAX(pc.start_date) AS latest_start_date,
+                MAX(pc.end_date) AS latest_end_date
             FROM Promotions p
             INNER JOIN Promotion_Devices pd
                 ON pd.promotion_id = p.id AND pd.eligible_model = @model
             INNER JOIN Promotion_Channels pc
                 ON pc.promotion_id = p.id AND pc.channel_code = @channelCode
-            ORDER BY p.id;
+            GROUP BY p.id, p.name, p.banner_url
+            ORDER BY latest_start_date DESC, latest_end_date DESC, p.id DESC
+            LIMIT 2;
             """,
             connection);
         promotionCommand.Parameters.AddWithValue("@model", model);

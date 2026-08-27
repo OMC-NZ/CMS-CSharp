@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using CMS_CSharp.Data.Repositories;
 using CMS_CSharp.Services.Storage;
+using CMS_CSharp.Validation;
 using MySqlConnector;
 
 namespace CMS_CSharp.Features.Claims;
@@ -15,12 +16,15 @@ internal sealed partial class ClaimCreationService(
 {
     private const string ClaimIdPrefix = "OPNZPROCLM";
     private const string ClaimIdAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    private const long ClaimFileMaxBytes = 5 * 1024 * 1024;
 
     public async Task<CreateClaimResult> CreateAsync(
         CreateClaimCommand request,
         CancellationToken cancellationToken)
     {
-        ValidateRequest(request);
+        request = NormalizeAndValidateRequest(request);
+        await ValidateUploadFileAsync(request.Receipt, "receipt", cancellationToken);
+        await ValidateUploadFileAsync(request.Screenshot, "screenshot", cancellationToken);
 
         var connectionString = configuration.GetConnectionString("DefaultConnection");
         if (string.IsNullOrWhiteSpace(connectionString))
@@ -140,22 +144,6 @@ internal sealed partial class ClaimCreationService(
                     : request.Instructions.Trim()),
                 ("@updatedAt", now));
 
-            await using var redeemCommand = new MySqlCommand(
-                """
-                UPDATE Devices
-                SET redemption_status = 1, updated_at = @updatedAt
-                WHERE imei = @imei AND redemption_status = 0;
-                """,
-                connection,
-                transaction);
-            redeemCommand.Parameters.AddWithValue("@updatedAt", now);
-            redeemCommand.Parameters.AddWithValue("@imei", request.Imei.Trim());
-            if (await redeemCommand.ExecuteNonQueryAsync(cancellationToken) != 1)
-            {
-                throw new ClaimConflictException(
-                    "The device has already been redeemed by another claim.");
-            }
-
             await transaction.CommitAsync(cancellationToken);
 
             return new CreateClaimResult(
@@ -247,8 +235,7 @@ internal sealed partial class ClaimCreationService(
     {
         await using var command = new MySqlCommand(
             """
-            SELECT d.redemption_status,
-                   EXISTS(
+            SELECT EXISTS(
                        SELECT 1 FROM Promotion_Devices pd
                        WHERE pd.promotion_id = @promotionId
                          AND pd.eligible_model = d.model
@@ -261,8 +248,7 @@ internal sealed partial class ClaimCreationService(
                    ) AS channel_is_eligible
             FROM Devices d
             WHERE d.imei = @imei
-            LIMIT 1
-            FOR UPDATE;
+            LIMIT 1;
             """,
             connection,
             transaction);
@@ -276,18 +262,13 @@ internal sealed partial class ClaimCreationService(
             throw new ClaimValidationException($"Device IMEI '{imei}' does not exist.");
         }
 
-        if (reader.GetBoolean(0))
-        {
-            throw new ClaimConflictException("The device has already been redeemed.");
-        }
-
-        if (!reader.GetBoolean(1))
+        if (!reader.GetBoolean(0))
         {
             throw new ClaimValidationException(
                 "The device model is not eligible for the selected promotion.");
         }
 
-        if (!reader.GetBoolean(2))
+        if (!reader.GetBoolean(1))
         {
             throw new ClaimValidationException(
                 "The device channel or purchase date is not eligible for the selected promotion.");
@@ -417,44 +398,119 @@ internal sealed partial class ClaimCreationService(
         return result.Date;
     }
 
-    private static void ValidateRequest(CreateClaimCommand request)
+    private static CreateClaimCommand NormalizeAndValidateRequest(
+        CreateClaimCommand request)
     {
-        if (request.PromotionId <= 0 ||
-            string.IsNullOrWhiteSpace(request.Imei) ||
-            request.Imei.Trim().Length != 15 ||
-            request.Imei.Trim().Any(character => !char.IsAsciiDigit(character)) ||
-            string.IsNullOrWhiteSpace(request.PurchaseDate) ||
-            string.IsNullOrWhiteSpace(request.FirstName) ||
-            string.IsNullOrWhiteSpace(request.LastName) ||
-            string.IsNullOrWhiteSpace(request.Email) ||
-            string.IsNullOrWhiteSpace(request.Contact) ||
-            string.IsNullOrWhiteSpace(request.Street) ||
-            string.IsNullOrWhiteSpace(request.Suburb) ||
-            string.IsNullOrWhiteSpace(request.City) ||
-            string.IsNullOrWhiteSpace(request.Postcode))
+        CreateClaimCommand normalized;
+        try
         {
-            throw new ClaimValidationException(
-                "Promotion, a 15-character IMEI, purchase date, customer details, and delivery address are required.");
+            normalized = request with
+            {
+                Imei = CommonInputRules.NormalizeDigits(request.Imei, "imei", 15),
+                PurchaseDate = CommonInputRules.NormalizeRequiredAscii(
+                    request.PurchaseDate,
+                    "purchaseDate"),
+                FirstName = CommonInputRules.NormalizeTitle(request.FirstName, "firstName"),
+                LastName = CommonInputRules.NormalizeTitle(request.LastName, "lastName"),
+                Email = CommonInputRules.NormalizeEmail(request.Email),
+                Contact = CommonInputRules.NormalizeContact(request.Contact),
+                Street = CommonInputRules.NormalizeTitle(request.Street, "street"),
+                Suburb = CommonInputRules.NormalizeTitle(request.Suburb, "suburb"),
+                City = CommonInputRules.NormalizeTitle(request.City, "city"),
+                Postcode = CommonInputRules.NormalizePostcode(request.Postcode),
+                Instructions = CommonInputRules.NormalizeOptionalAscii(
+                    request.Instructions,
+                    "instructions"),
+                GiftAliases = request.GiftAliases
+                    .Select(alias => CommonInputRules.NormalizeRequiredAscii(alias, "gift alias"))
+                    .ToArray()
+            };
+        }
+        catch (InputValidationException exception)
+        {
+            throw new ClaimValidationException(exception.Message);
         }
 
-        if (request.GiftAliases.Count == 0 ||
-            request.GiftAliases.Any(string.IsNullOrWhiteSpace))
+        if (normalized.PromotionId <= 0)
+        {
+            throw new ClaimValidationException("promotionId must be a positive integer.");
+        }
+
+        if (normalized.GiftAliases.Count == 0 ||
+            normalized.GiftAliases.Any(string.IsNullOrWhiteSpace))
         {
             throw new ClaimValidationException("At least one gift alias is required.");
         }
 
-        if (request.Receipt.Length == 0 || request.Screenshot.Length == 0)
+        return normalized;
+    }
+
+    private static async Task ValidateUploadFileAsync(
+        IFormFile file,
+        string fieldName,
+        CancellationToken cancellationToken)
+    {
+        if (file.Length == 0)
         {
             throw new ClaimValidationException(
-                "Non-empty receipt and screenshot files are required.");
+                $"The {fieldName} file must not be empty.");
+        }
+
+        if (file.Length > ClaimFileMaxBytes)
+        {
+            throw new ClaimValidationException(
+                $"The {fieldName} file must not exceed 5 MB.");
+        }
+
+        var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
+        if (extension is not (".jpg" or ".jpeg" or ".png" or ".pdf"))
+        {
+            throw new ClaimValidationException(
+                $"The {fieldName} file must be JPG, JPEG, PNG, or PDF.");
+        }
+
+        var header = new byte[8];
+        await using var stream = file.OpenReadStream();
+        var bytesRead = 0;
+        while (bytesRead < header.Length)
+        {
+            var read = await stream.ReadAsync(
+                header.AsMemory(bytesRead, header.Length - bytesRead),
+                cancellationToken);
+            if (read == 0)
+            {
+                break;
+            }
+
+            bytesRead += read;
+        }
+        var hasExpectedSignature = extension switch
+        {
+            ".jpg" or ".jpeg" =>
+                bytesRead >= 3 && header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF,
+            ".png" =>
+                bytesRead >= 8 && header.AsSpan().SequenceEqual(
+                    new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }),
+            ".pdf" =>
+                bytesRead >= 5 && header.AsSpan(0, 5).SequenceEqual("%PDF-"u8),
+            _ => false
+        };
+
+        if (!hasExpectedSignature)
+        {
+            throw new ClaimValidationException(
+                $"The {fieldName} file content does not match its extension.");
         }
     }
 
     private static string SanitizePathSegment(string value)
     {
-        var sanitized = InvalidPathSegmentRegex().Replace(value.Trim(), "-").Trim(' ', '.');
+        var sanitized = PromotionFolderRegex()
+            .Replace(value.Trim().ToLowerInvariant(), "-")
+            .Trim('-');
         return string.IsNullOrWhiteSpace(sanitized) ? "unnamed-promotion" : sanitized;
     }
+
 
     private static string NormalizeExtension(string fileName)
     {
@@ -481,6 +537,7 @@ internal sealed partial class ClaimCreationService(
         return normalized;
     }
 
-    [GeneratedRegex(@"[\\/\x00-\x1F]")]
-    private static partial Regex InvalidPathSegmentRegex();
+    [GeneratedRegex(@"[^a-z0-9]+", RegexOptions.CultureInvariant)]
+    private static partial Regex PromotionFolderRegex();
+
 }
