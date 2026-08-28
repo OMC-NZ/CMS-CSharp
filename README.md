@@ -358,9 +358,12 @@ Query parameters:
 
 Additional filters:
 
-- `category` must be `11` or `21`.
+- `category` must be exactly `11`.
 - `redemption_status` must be `0`.
-- Duplicate results are merged by `market_name + model`.
+- `channel_code` values `OTH`, `SCS`, `CAS`, `DOW`, `GWP`, `HSP`, `LAU`, `MCG`, `OAU`, `PAC`, `REP`, `VDFP`, `VSS`, and `APL` are excluded.
+- Devices are joined to `Channels` by `Devices.channel_code = Channels.code`.
+- Duplicate Device results are merged by `market_name + model`.
+- Each Device result contains all distinct matching Channel names and codes.
 
 Example request:
 
@@ -374,7 +377,13 @@ Success response: `200 OK`
 [
   {
     "market_name": "Temp",
-    "model": "CPH2689"
+    "model": "CPH2689",
+    "channels": [
+      {
+        "channel_name": "Example Retailer",
+        "channel_code": "EX01"
+      }
+    ]
   }
 ]
 ```

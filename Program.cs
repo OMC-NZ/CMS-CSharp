@@ -177,7 +177,8 @@ app.MapGet("/api/devices/search", async (
 
     try
     {
-        var devices = new List<DeviceSearchResult>();
+        var devices = new Dictionary<(string MarketName, string Model),
+            HashSet<(string ChannelName, string ChannelCode)>>();
         var mysqlConnectionString = NormalizeMySqlConnectionString(connectionString);
 
         await using var connection = new MySqlConnection(mysqlConnectionString);
@@ -186,13 +187,20 @@ app.MapGet("/api/devices/search", async (
         await using var command = connection.CreateCommand();
         command.CommandText = """
             SELECT DISTINCT
-                market_name,
-                model
-            FROM Devices
-            WHERE market_name LIKE CONCAT('%', @marketName, '%') ESCAPE '='
-              AND category IN (11, 21)
-              AND redemption_status = 0
-            ORDER BY market_name, model;
+                d.market_name,
+                d.model,
+                c.name AS channel_name,
+                c.code AS channel_code
+            FROM Devices d
+            INNER JOIN Channels c ON c.code = d.channel_code
+            WHERE d.market_name LIKE CONCAT('%', @marketName, '%') ESCAPE '='
+              AND d.category = 11
+              AND d.redemption_status = 0
+              AND d.channel_code NOT IN (
+                  'OTH', 'SCS', 'CAS', 'DOW', 'GWP', 'HSP', 'LAU',
+                  'MCG', 'OAU', 'PAC', 'REP', 'VDFP', 'VSS', 'APL'
+              )
+            ORDER BY d.market_name, d.model, c.name, c.code;
             """;
         command.Parameters.Add(
             new MySqlParameter("@marketName", MySqlDbType.VarChar)
@@ -203,12 +211,33 @@ app.MapGet("/api/devices/search", async (
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
-            devices.Add(new DeviceSearchResult(
+            var key = (
                 reader.GetString("market_name"),
-                reader.GetString("model")));
+                reader.GetString("model"));
+            if (!devices.TryGetValue(key, out var channels))
+            {
+                channels = [];
+                devices[key] = channels;
+            }
+
+            channels.Add((
+                reader.GetString("channel_name"),
+                reader.GetString("channel_code")));
         }
 
-        return Results.Ok(devices);
+        var result = devices.Select(device => new DeviceSearchResult(
+            device.Key.MarketName,
+            device.Key.Model,
+            device.Value
+                .OrderBy(channel => channel.ChannelName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(channel => channel.ChannelCode, StringComparer.OrdinalIgnoreCase)
+                .Select(channel => new DeviceSearchChannelResult(
+                    channel.ChannelName,
+                    channel.ChannelCode))
+                .ToArray()))
+            .ToArray();
+
+        return Results.Ok(result);
     }
     catch (Exception exception) when (exception is MySqlException or InvalidOperationException or ArgumentException)
     {
