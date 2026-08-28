@@ -27,37 +27,33 @@ internal sealed partial class PromotionCreationService(
 
         try
         {
-            await using (var bannerStream = request.Banner.OpenReadStream())
-            {
-                await r2Storage.UploadAsync(
-                    bannerStream,
-                    bannerObjectKey,
-                    request.Banner.ContentType,
-                    cancellationToken);
-            }
-            uploadedObjectKeys.Add(bannerObjectKey);
-
-            string termsUrl;
+            var bannerUploadTask = UploadFileAsync(request.Banner, bannerObjectKey, cancellationToken);
+            Task<R2UploadResult>? termsUploadTask = null;
+            string? termsObjectKey = null;
             if (request.TermsFile is not null)
             {
                 var termsExtension = NormalizeExtension(request.TermsFile.FileName);
                 var termsFileName = $"{Guid.NewGuid():N}{termsExtension}";
-                var termsObjectKey = $"terms/Promotions/{termsFileName}";
-
-                await using var termsStream = request.TermsFile.OpenReadStream();
-                var termsUpload = await r2Storage.UploadAsync(
-                    termsStream,
-                    termsObjectKey,
-                    request.TermsFile.ContentType,
-                    cancellationToken);
-
-                uploadedObjectKeys.Add(termsObjectKey);
-                termsUrl = termsUpload.PublicUrl;
+                termsObjectKey = $"terms/Promotions/{termsFileName}";
+                termsUploadTask = UploadFileAsync(request.TermsFile, termsObjectKey, cancellationToken);
             }
-            else
+
+            try
             {
-                termsUrl = request.TermsPath!;
+                if (termsUploadTask is null)
+                    await bannerUploadTask;
+                else
+                    await Task.WhenAll(bannerUploadTask, termsUploadTask);
             }
+            finally
+            {
+                if (bannerUploadTask.IsCompletedSuccessfully) uploadedObjectKeys.Add(bannerObjectKey);
+                if (termsUploadTask?.IsCompletedSuccessfully == true) uploadedObjectKeys.Add(termsObjectKey!);
+            }
+
+            var termsUrl = termsUploadTask is null
+                ? request.TermsPath!
+                : (await termsUploadTask).PublicUrl;
 
             return await SaveToDatabaseAsync(
                 request,
@@ -70,6 +66,13 @@ internal sealed partial class PromotionCreationService(
             await DeleteUploadedObjectsAsync(uploadedObjectKeys);
             throw;
         }
+    }
+
+    private async Task<R2UploadResult> UploadFileAsync(
+        IFormFile file, string objectKey, CancellationToken cancellationToken)
+    {
+        await using var stream = file.OpenReadStream();
+        return await r2Storage.UploadAsync(stream, objectKey, file.ContentType, cancellationToken);
     }
 
     private async Task<CreatePromotionResult> SaveToDatabaseAsync(
@@ -99,14 +102,12 @@ internal sealed partial class PromotionCreationService(
             var channels = request.Channels
                 .DistinctBy(channel => channel.Code.Trim(), StringComparer.OrdinalIgnoreCase)
                 .ToArray();
+            var existingChannelCodes = await referenceData.FindExistingChannelCodesAsync(
+                connection, transaction, channels.Select(x => x.Code.Trim()).ToArray(), cancellationToken);
             var validChannels = new List<PromotionChannelInput>();
             foreach (var channel in channels)
             {
-                if (await referenceData.ChannelExistsByCodeAsync(
-                    connection,
-                    transaction,
-                    channel.Code,
-                    cancellationToken))
+                if (existingChannelCodes.Contains(channel.Code.Trim()))
                 {
                     validChannels.Add(channel);
                 }
@@ -123,15 +124,12 @@ internal sealed partial class PromotionCreationService(
                 .ToArray();
             var matchedChannelCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var validModels = new List<string>();
+            var channelCodesByModel = await referenceData.GetDeviceChannelCodesByModelsAsync(
+                connection, transaction, products, validChannelCodes, cancellationToken);
             foreach (var model in products)
             {
-                var productChannelCodes = await referenceData.GetDeviceChannelCodesByModelAsync(
-                    connection,
-                    transaction,
-                    model,
-                    validChannelCodes,
-                    cancellationToken);
-                if (productChannelCodes.Count == 0)
+                if (!channelCodesByModel.TryGetValue(model, out var productChannelCodes) ||
+                    productChannelCodes.Count == 0)
                 {
                     logger.LogWarning(
                         "Skipping promotion device model {Model}; it does not match any selected channel.",
@@ -180,20 +178,17 @@ internal sealed partial class PromotionCreationService(
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             var giftIds = new List<int>();
+            var giftIdsByAlias = await referenceData.FindGiftIdsByAliasesAsync(
+                connection, transaction, gifts, cancellationToken);
             foreach (var giftAlias in gifts)
             {
-                var giftId = await referenceData.FindGiftIdByAliasAsync(
-                    connection,
-                    transaction,
-                    giftAlias,
-                    cancellationToken);
-                if (giftId is null)
+                if (!giftIdsByAlias.TryGetValue(giftAlias, out var giftId))
                 {
                     throw new PromotionValidationException(
                         $"Gift alias '{giftAlias}' does not exist.");
                 }
 
-                giftIds.Add(giftId.Value);
+                giftIds.Add(giftId);
             }
 
             var comparisonData = new PromotionComparisonData(

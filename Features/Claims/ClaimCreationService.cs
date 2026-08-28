@@ -1,7 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
-using CMS_CSharp.Data.Repositories;
+using CMS_CSharp.Services.Email;
 using CMS_CSharp.Services.Storage;
 using CMS_CSharp.Validation;
 using MySqlConnector;
@@ -11,11 +11,12 @@ namespace CMS_CSharp.Features.Claims;
 internal sealed partial class ClaimCreationService(
     IConfiguration configuration,
     IR2StorageService r2Storage,
-    IReferenceDataRepository referenceData,
+    IClaimConfirmationEmailQueue confirmationEmailQueue,
     ILogger<ClaimCreationService> logger)
 {
     private const string ClaimIdPrefix = "OPNZPROCLM";
     private const string ClaimIdAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    private const string ClaimObjectKeyPrefix = "claims/promotions/";
     private const long ClaimFileMaxBytes = 5 * 1024 * 1024;
 
     public async Task<CreateClaimResult> CreateAsync(
@@ -37,46 +38,64 @@ internal sealed partial class ClaimCreationService(
         await using var connection = new MySqlConnection(
             NormalizeMySqlConnectionString(connectionString));
         await connection.OpenAsync(cancellationToken);
-        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        MySqlTransaction? transaction = null;
 
         try
         {
             var purchaseDate = ParsePurchaseDate(request.PurchaseDate);
             var promotionName = await GetPromotionNameAsync(
                 connection,
-                transaction,
+                null,
                 request.PromotionId,
                 cancellationToken);
-            await ValidateDeviceAsync(
+            await ValidateDeviceExistsAsync(
                 connection,
-                transaction,
-                request.PromotionId,
+                null,
                 request.Imei,
-                purchaseDate,
                 cancellationToken);
 
             var giftIds = await ResolveGiftIdsAsync(
                 connection,
-                transaction,
+                null,
                 request.PromotionId,
                 request.GiftAliases,
                 cancellationToken);
             var claimId = await CreateUniqueClaimIdAsync(
                 connection,
-                transaction,
+                null,
                 cancellationToken);
 
             var promotionPath = SanitizePathSegment(promotionName);
-            var receiptUpload = await UploadClaimFileAsync(
+            var claimFolder = $"claims/promotions/{promotionPath}";
+            var receiptUploadTask = UploadClaimFileAsync(
                 request.Receipt,
-                $"claims/promotions/{promotionPath}",
-                uploadedObjectKeys,
+                claimFolder,
                 cancellationToken);
-            var screenshotUpload = await UploadClaimFileAsync(
+            var screenshotUploadTask = UploadClaimFileAsync(
                 request.Screenshot,
-                $"claims/promotions/{promotionPath}",
-                uploadedObjectKeys,
+                claimFolder,
                 cancellationToken);
+            try
+            {
+                await Task.WhenAll(receiptUploadTask, screenshotUploadTask);
+            }
+            finally
+            {
+                if (receiptUploadTask.IsCompletedSuccessfully)
+                {
+                    uploadedObjectKeys.Add(receiptUploadTask.Result.ObjectKey);
+                }
+
+                if (screenshotUploadTask.IsCompletedSuccessfully)
+                {
+                    uploadedObjectKeys.Add(screenshotUploadTask.Result.ObjectKey);
+                }
+            }
+
+            var receiptUpload = await receiptUploadTask;
+            var screenshotUpload = await screenshotUploadTask;
+
+            transaction = await connection.BeginTransactionAsync(cancellationToken);
 
             var now = DateTime.UtcNow;
             var customerId = await InsertCustomerAsync(
@@ -103,8 +122,8 @@ internal sealed partial class ClaimCreationService(
                 ("@imei", request.Imei.Trim()),
                 ("@customerId", customerId),
                 ("@purchaseDate", purchaseDate),
-                ("@receiptUrl", receiptUpload.PublicUrl),
-                ("@screenshotUrl", screenshotUpload.PublicUrl),
+                ("@receiptUrl", ToStoredClaimPath(receiptUpload.ObjectKey)),
+                ("@screenshotUrl", ToStoredClaimPath(screenshotUpload.ObjectKey)),
                 ("@createdAt", now),
                 ("@updatedAt", now));
 
@@ -144,7 +163,27 @@ internal sealed partial class ClaimCreationService(
                     : request.Instructions.Trim()),
                 ("@updatedAt", now));
 
+            await ExecuteAsync(
+                connection,
+                transaction,
+                """
+                UPDATE Devices
+                SET redemption_status = 1, updated_at = @updatedAt
+                WHERE imei = @imei;
+                """,
+                cancellationToken,
+                ("@updatedAt", now),
+                ("@imei", request.Imei));
+
             await transaction.CommitAsync(cancellationToken);
+
+            var emailQueued = confirmationEmailQueue.TryQueue(claimId);
+            if (!emailQueued)
+            {
+                logger.LogError(
+                    "Claim confirmation email could not be queued for claim {ClaimId}.",
+                    claimId);
+            }
 
             return new CreateClaimResult(
                 claimId,
@@ -152,66 +191,98 @@ internal sealed partial class ClaimCreationService(
                 customerId,
                 request.Imei.Trim(),
                 giftIds,
-                receiptUpload.PublicUrl,
-                screenshotUpload.PublicUrl);
+                ToStoredClaimPath(receiptUpload.ObjectKey),
+                ToStoredClaimPath(screenshotUpload.ObjectKey),
+                emailQueued);
         }
         catch
         {
-            await transaction.RollbackAsync(CancellationToken.None);
+            if (transaction is not null)
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+            }
             await DeleteUploadedObjectsAsync(uploadedObjectKeys);
             throw;
+        }
+        finally
+        {
+            if (transaction is not null)
+            {
+                await transaction.DisposeAsync();
+            }
         }
     }
 
     private async Task<IReadOnlyList<int>> ResolveGiftIdsAsync(
         MySqlConnection connection,
-        MySqlTransaction transaction,
+        MySqlTransaction? transaction,
         int promotionId,
         IReadOnlyList<string> giftAliases,
         CancellationToken cancellationToken)
     {
-        var giftIds = new List<int>();
-        foreach (var alias in giftAliases
-                     .Select(value => value.Trim())
-                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        var aliases = giftAliases
+            .Select(value => value.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var aliasParameters = aliases
+            .Select((_, index) => $"@alias{index}")
+            .ToArray();
+
+        await using var command = new MySqlCommand(
+            $"""
+            SELECT
+                g.alias,
+                g.id,
+                EXISTS(
+                    SELECT 1
+                    FROM Promotion_Gifts pg
+                    WHERE pg.promotion_id = @promotionId
+                      AND pg.gift_id = g.id
+                ) AS is_available
+            FROM Gifts g
+            WHERE g.alias IN ({string.Join(", ", aliasParameters)});
+            """,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("@promotionId", promotionId);
+        for (var index = 0; index < aliases.Length; index++)
         {
-            var giftId = await referenceData.FindGiftIdByAliasAsync(
-                connection,
-                transaction,
-                alias,
-                cancellationToken);
-            if (giftId is null)
+            command.Parameters.AddWithValue(aliasParameters[index], aliases[index]);
+        }
+
+        var resolved = new Dictionary<string, (int Id, bool IsAvailable)>(
+            StringComparer.OrdinalIgnoreCase);
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                resolved[reader.GetString(0)] = (reader.GetInt32(1), reader.GetBoolean(2));
+            }
+        }
+
+        var giftIds = new List<int>(aliases.Length);
+        foreach (var alias in aliases)
+        {
+            if (!resolved.TryGetValue(alias, out var gift))
             {
                 throw new ClaimValidationException($"Gift alias '{alias}' does not exist.");
             }
 
-            await using var command = new MySqlCommand(
-                """
-                SELECT EXISTS(
-                    SELECT 1
-                    FROM Promotion_Gifts
-                    WHERE promotion_id = @promotionId AND gift_id = @giftId
-                );
-                """,
-                connection,
-                transaction);
-            command.Parameters.AddWithValue("@promotionId", promotionId);
-            command.Parameters.AddWithValue("@giftId", giftId.Value);
-            if (Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken)) == 0)
+            if (!gift.IsAvailable)
             {
                 throw new ClaimValidationException(
                     $"Gift alias '{alias}' is not available for the selected promotion.");
             }
 
-            giftIds.Add(giftId.Value);
+            giftIds.Add(gift.Id);
         }
 
-        return giftIds.Distinct().ToArray();
+        return giftIds;
     }
 
     private static async Task<string> GetPromotionNameAsync(
         MySqlConnection connection,
-        MySqlTransaction transaction,
+        MySqlTransaction? transaction,
         int promotionId,
         CancellationToken cancellationToken)
     {
@@ -225,77 +296,47 @@ internal sealed partial class ClaimCreationService(
             $"Promotion '{promotionId}' does not exist.");
     }
 
-    private static async Task ValidateDeviceAsync(
+    private static async Task ValidateDeviceExistsAsync(
         MySqlConnection connection,
-        MySqlTransaction transaction,
-        int promotionId,
+        MySqlTransaction? transaction,
         string imei,
-        DateTime purchaseDate,
         CancellationToken cancellationToken)
     {
         await using var command = new MySqlCommand(
             """
-            SELECT EXISTS(
-                       SELECT 1 FROM Promotion_Devices pd
-                       WHERE pd.promotion_id = @promotionId
-                         AND pd.eligible_model = d.model
-                   ) AS model_is_eligible,
-                   EXISTS(
-                       SELECT 1 FROM Promotion_Channels pc
-                       WHERE pc.promotion_id = @promotionId
-                         AND pc.channel_code = d.channel_code
-                         AND @purchaseDate BETWEEN pc.start_date AND pc.end_date
-                   ) AS channel_is_eligible
-            FROM Devices d
-            WHERE d.imei = @imei
+            SELECT 1
+            FROM Devices
+            WHERE imei = @imei
             LIMIT 1;
             """,
             connection,
             transaction);
-        command.Parameters.AddWithValue("@promotionId", promotionId);
         command.Parameters.AddWithValue("@imei", imei.Trim());
-        command.Parameters.AddWithValue("@purchaseDate", purchaseDate);
 
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        if (!await reader.ReadAsync(cancellationToken))
+        if (await command.ExecuteScalarAsync(cancellationToken) is null)
         {
             throw new ClaimValidationException($"Device IMEI '{imei}' does not exist.");
-        }
-
-        if (!reader.GetBoolean(0))
-        {
-            throw new ClaimValidationException(
-                "The device model is not eligible for the selected promotion.");
-        }
-
-        if (!reader.GetBoolean(1))
-        {
-            throw new ClaimValidationException(
-                "The device channel or purchase date is not eligible for the selected promotion.");
         }
     }
 
     private async Task<R2UploadResult> UploadClaimFileAsync(
         IFormFile file,
         string folder,
-        ICollection<string> uploadedObjectKeys,
         CancellationToken cancellationToken)
     {
         var fileName = $"{Guid.NewGuid():N}{NormalizeExtension(file.FileName)}";
         var objectKey = $"{folder}/{fileName}";
         await using var stream = file.OpenReadStream();
-        var result = await r2Storage.UploadAsync(
+        return await r2Storage.UploadAsync(
             stream,
             objectKey,
             file.ContentType,
             cancellationToken);
-        uploadedObjectKeys.Add(objectKey);
-        return result;
     }
 
     private static async Task<int> InsertCustomerAsync(
         MySqlConnection connection,
-        MySqlTransaction transaction,
+        MySqlTransaction? transaction,
         CreateClaimCommand request,
         DateTime updatedAt,
         CancellationToken cancellationToken)
@@ -318,7 +359,7 @@ internal sealed partial class ClaimCreationService(
 
     private static async Task<string> CreateUniqueClaimIdAsync(
         MySqlConnection connection,
-        MySqlTransaction transaction,
+        MySqlTransaction? transaction,
         CancellationToken cancellationToken)
     {
         while (true)
@@ -510,6 +551,11 @@ internal sealed partial class ClaimCreationService(
             .Trim('-');
         return string.IsNullOrWhiteSpace(sanitized) ? "unnamed-promotion" : sanitized;
     }
+
+    private static string ToStoredClaimPath(string objectKey) =>
+        objectKey.StartsWith(ClaimObjectKeyPrefix, StringComparison.Ordinal)
+            ? objectKey[ClaimObjectKeyPrefix.Length..]
+            : objectKey;
 
 
     private static string NormalizeExtension(string fileName)

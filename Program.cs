@@ -7,6 +7,7 @@ using CMS_CSharp.Data.Repositories;
 using CMS_CSharp.Features.Claims;
 using CMS_CSharp.Features.Promotions;
 using CMS_CSharp.Features.Promotions.DuplicateDetection;
+using CMS_CSharp.Services.Email;
 using CMS_CSharp.Services.Storage;
 using MySqlConnector;
 
@@ -20,6 +21,12 @@ builder.Logging.AddConsole();
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddHealthChecks();
 builder.Services.AddSingleton<IR2StorageService, R2StorageService>();
+builder.Services.AddScoped<IClaimConfirmationEmailService, ClaimConfirmationEmailService>();
+builder.Services.AddSingleton<ClaimConfirmationEmailQueue>();
+builder.Services.AddSingleton<IClaimConfirmationEmailQueue>(serviceProvider =>
+    serviceProvider.GetRequiredService<ClaimConfirmationEmailQueue>());
+builder.Services.AddHostedService(serviceProvider =>
+    serviceProvider.GetRequiredService<ClaimConfirmationEmailQueue>());
 builder.Services.AddScoped<IReferenceDataRepository, ReferenceDataRepository>();
 builder.Services.AddScoped<PromotionConflictDetector>();
 builder.Services.AddScoped<PromotionCreationService>();

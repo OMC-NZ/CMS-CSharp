@@ -24,4 +24,5 @@ internal sealed record CreateClaimResult(
     string Imei,
     IReadOnlyList<int> GiftIds,
     string ReceiptUrl,
-    string ScreenshotUrl);
+    string ScreenshotUrl,
+    bool EmailQueued);

@@ -119,17 +119,27 @@ Matching rules:
 - `Promotions.banner_url` is treated as the stored banner filename and expanded to `{R2_PUBLIC_ASSETS_URL}/banners/Promotions/{banner-file}`. An already absolute banner URL is returned unchanged.
 - The response returns the public image URL; it does not proxy the image binary through this API.
 - Device model, channel code, Promotion description, and Gifts are used or resolved internally as needed but are not included in the response. The queried IMEI is included in the response.
+- Device matching, the two most recent Promotions, and Claim IDs are read in one database command to reduce request latency.
+- `claimIds` contains every `Claims.id` for the queried IMEI, ordered by `created_at` and then ID descending. It is an empty array when the IMEI has no Claim, so its length always equals the number of matching Claims.
+- Each returned Promotion includes the matched `Channels.name` as `channelName` and the corresponding `Promotion_Channels.start_date` and `end_date` formatted as `yyyy-MM-dd HH:mm:ss`. The channel code is not returned.
 
 Success response: `200 OK`
 
 ```json
 {
   "imei": "490154203237518",
+  "claimIds": [
+    "OPNZPROCLM-260828-4EUZB66Y",
+    "OPNZPROCLM-260827-8KM80SDG"
+  ],
   "promotions": [
     {
       "id": 123,
       "name": "Example Promotion",
-      "bannerUrl": "https://assets.example.com/banners/Promotions/banner-uuid.webp"
+      "bannerUrl": "https://assets.example.com/banners/Promotions/banner-uuid.webp",
+      "channelName": "Spark",
+      "startDate": "2026-09-01 00:00:00",
+      "endDate": "2026-09-28 23:59:59"
     }
   ]
 }
@@ -151,6 +161,8 @@ Content-Type: multipart/form-data
 ```
 
 Creates a promotion, uploads its files to Cloudflare R2, and inserts all related database records in one MySQL transaction.
+
+Channel, Device, Gift, and duplicate-conflict lookups are batched. When both a banner and Terms file are supplied, their R2 uploads run concurrently.
 
 Multipart form fields:
 
@@ -254,7 +266,9 @@ POST /api/claims
 Content-Type: multipart/form-data
 ```
 
-Creates a customer and claim, records its gifts and delivery address, and uploads the receipt and screenshot to Cloudflare R2 in one database transaction.
+Creates a customer and claim, records its gifts and delivery address, uploads the receipt and screenshot to Cloudflare R2, marks the Device as redeemed, and queues the claim confirmation email for background delivery.
+
+The receipt and screenshot are uploaded concurrently. Reference checks are batched before the short database write transaction to reduce request latency and lock time.
 
 Multipart form fields:
 
@@ -291,18 +305,21 @@ Validation and persistence rules:
 - All whitespace is removed from `contact`, which must then contain digits only.
 - `postcode` must contain exactly four digits; a leading zero is retained.
 - The Promotion must exist.
-- The IMEI must contain exactly 15 digits and exist in `Devices`. `Devices.redemption_status` is neither checked nor changed by this endpoint.
-- The existing Device model must be in `Promotion_Devices` for the selected Promotion.
-- The Device channel must exist in `Promotion_Channels`, and `purchaseDate` must be within that channel's `start_date` and `end_date`.
+- The IMEI must contain exactly 15 digits and exist in `Devices`. Its existing `redemption_status` value is not used to reject the Claim.
+- Device model, channel, and `purchaseDate` are not used to determine Claim eligibility. `purchaseDate` is validated only as `yyyy-MM-dd` and stored in `Claims.purchase_date`.
 - Every Gift alias is resolved to `Gifts.id` and must exist in `Promotion_Gifts` for the selected Promotion.
 - A new `Customers` row is inserted first and its generated ID is stored in `Claims.customer_id`.
 - The Claim ID format is `OPNZPROCLM-yyMMdd-XXXXXXXX`, using the current `Pacific/Auckland` date. The final eight characters are cryptographically generated uppercase letters or digits, and the generated ID is checked against `Claims.id` before use.
-- Receipt and screenshot files are independently renamed to UUID filenames while retaining their validated extensions. The backend validates both the extension and the file signature and rejects files larger than 5 MB.
+- Receipt and screenshot files are independently renamed to UUID filenames while retaining their validated extensions. The backend validates both the extension and the file signature, rejects files larger than 5 MB, and uploads both files concurrently.
 - Both files are uploaded under `claims/promotions/{promotion-name}/{uuid}.{extension}`. The Promotion name is converted to lowercase, and each sequence of spaces or non-alphanumeric characters is replaced with one `-` (for example, `OPPO Reno Promotion 2026` becomes `oppo-reno-promotion-2026`).
-- `Claims.receipt_url` and `Claims.screenshot_url` store the corresponding public R2 URLs.
+- Files are uploaded to R2 under `claims/promotions/{promotion-name}/{uuid}.{extension}`, but `Claims.receipt_url` and `Claims.screenshot_url` store only `{promotion-name}/{uuid}.{extension}`. Neither the public domain nor the `claims/promotions/` prefix is stored.
 - `Claims.status` and `Claims.email_status` initially use `0`.
 - Selected Gifts are inserted into `Claim_Gifts`, and the delivery address is inserted into the existing `Deliver_Addresses` table with `is_current = 1`.
+- Before the Claim transaction commits, the matching Device is always updated to `redemption_status = 1`, regardless of its previous value.
 - If any database operation fails, the transaction is rolled back and files uploaded by the request are removed from R2.
+- After the Claim transaction commits, the backend queues the confirmation email and returns without waiting for SMTP. A background service sends the email to `Customers.email`; the message contains the customer name, Claim ID, selected Gift names and colors, and delivery address.
+- A successful email changes `Claims.email_status` to `1`. A failed email leaves it at `0`, logs the failure, and attempts to notify `EMAIL_ADMIN`.
+- SMTP failure does not roll back an already committed Claim and does not make the frontend retry the full Claim creation request.
 
 Success response: `201 Created`
 
@@ -313,10 +330,13 @@ Success response: `201 Created`
   "customerId": 456,
   "imei": "490154203237518",
   "giftIds": [12],
-  "receiptUrl": "https://assets.example.com/claims/promotions/example-promotion/uuid.pdf",
-  "screenshotUrl": "https://assets.example.com/claims/promotions/example-promotion/uuid.png"
+  "receiptUrl": "example-promotion/uuid.pdf",
+  "screenshotUrl": "example-promotion/uuid.png",
+  "emailQueued": true
 }
 ```
+
+`emailQueued` reports whether the committed Claim was accepted by the in-process email queue; it does not mean SMTP delivery has already completed. `Claims.email_status` remains `0` while queued or after a failed send and changes to `1` only after successful delivery.
 
 Validation failure response: `400 Bad Request`
 
@@ -484,8 +504,8 @@ Development and Production configuration files are ignored by Git and may contai
 | `EMAIL_PORT` | SMTP server port. |
 | `EMAIL_USER` | SMTP authentication username. |
 | `EMAIL_PASS` | SMTP authentication password. |
-| `EMAIL_FROM` | Sender email address used by the application. |
-| `EMAIL_ADMIN` | Administrative recipient email address. |
+| `EMAIL_FROM` | Sender address and customer-service contact shown in Claim confirmation emails. |
+| `EMAIL_ADMIN` | Administrative recipient for Claim email failure alerts. |
 
 PowerShell environment-variable example:
 

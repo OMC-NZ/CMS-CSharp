@@ -35,60 +35,73 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
             NormalizeMySqlConnectionString(connectionString));
         await connection.OpenAsync(cancellationToken);
 
-        string model;
-        string channelCode;
-        await using (var deviceCommand = new MySqlCommand(
-                         """
-                         SELECT model, channel_code
-                         FROM Devices
-                         WHERE imei = @imei
-                         LIMIT 1;
-                         """,
-                         connection))
-        {
-            deviceCommand.Parameters.AddWithValue("@imei", normalizedImei);
-            await using var reader = await deviceCommand.ExecuteReaderAsync(cancellationToken);
-            if (!await reader.ReadAsync(cancellationToken))
-            {
-                return null;
-            }
-
-            model = reader.GetString(0);
-            channelCode = reader.GetString(1);
-        }
-
-        await using var promotionCommand = new MySqlCommand(
+        await using var command = new MySqlCommand(
             """
             SELECT
+                d.imei,
                 p.id,
                 p.name,
                 p.banner_url,
+                c.name AS channel_name,
                 MAX(pc.start_date) AS latest_start_date,
                 MAX(pc.end_date) AS latest_end_date
-            FROM Promotions p
-            INNER JOIN Promotion_Devices pd
-                ON pd.promotion_id = p.id AND pd.eligible_model = @model
-            INNER JOIN Promotion_Channels pc
-                ON pc.promotion_id = p.id AND pc.channel_code = @channelCode
-            GROUP BY p.id, p.name, p.banner_url
+            FROM Devices d
+            LEFT JOIN Promotion_Devices pd
+                ON pd.eligible_model = d.model
+            LEFT JOIN Promotions p
+                ON p.id = pd.promotion_id
+            LEFT JOIN Promotion_Channels pc
+                ON pc.promotion_id = p.id AND pc.channel_code = d.channel_code
+            LEFT JOIN Channels c
+                ON c.code = pc.channel_code
+            WHERE d.imei = @imei
+            GROUP BY d.imei, p.id, p.name, p.banner_url, c.name
             ORDER BY latest_start_date DESC, latest_end_date DESC, p.id DESC
             LIMIT 2;
+
+            SELECT id
+            FROM Claims
+            WHERE imei = @imei
+            ORDER BY created_at DESC, id DESC;
             """,
             connection);
-        promotionCommand.Parameters.AddWithValue("@model", model);
-        promotionCommand.Parameters.AddWithValue("@channelCode", channelCode);
+        command.Parameters.AddWithValue("@imei", normalizedImei);
 
         var promotions = new List<EligiblePromotionResult>();
-        await using var promotionReader = await promotionCommand.ExecuteReaderAsync(cancellationToken);
-        while (await promotionReader.ReadAsync(cancellationToken))
+        var claimIds = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
         {
-            promotions.Add(new EligiblePromotionResult(
-                promotionReader.GetInt32(0),
-                promotionReader.GetString(1),
-                BuildBannerUrl(publicAssetsUrl, promotionReader.GetString(2))));
+            return null;
         }
 
-        return new EligiblePromotionsResult(normalizedImei, promotions);
+        do
+        {
+            if (!reader.IsDBNull(1) && !reader.IsDBNull(4))
+            {
+                promotions.Add(new EligiblePromotionResult(
+                    reader.GetInt32(1),
+                    reader.GetString(2),
+                    BuildBannerUrl(publicAssetsUrl, reader.GetString(3)),
+                    reader.GetString(4),
+                    reader.GetDateTime(5).ToString("yyyy-MM-dd HH:mm:ss"),
+                    reader.GetDateTime(6).ToString("yyyy-MM-dd HH:mm:ss")));
+            }
+        }
+        while (await reader.ReadAsync(cancellationToken));
+
+        if (await reader.NextResultAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                claimIds.Add(reader.GetString(0));
+            }
+        }
+
+        return new EligiblePromotionsResult(
+            normalizedImei,
+            claimIds,
+            promotions);
     }
 
     private static string BuildBannerUrl(string publicAssetsUrl, string bannerValue)
@@ -123,9 +136,13 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
 
 internal sealed record EligiblePromotionsResult(
     string Imei,
+    IReadOnlyList<string> ClaimIds,
     IReadOnlyList<EligiblePromotionResult> Promotions);
 
 internal sealed record EligiblePromotionResult(
     int Id,
     string Name,
-    string BannerUrl);
+    string BannerUrl,
+    string ChannelName,
+    string StartDate,
+    string EndDate);

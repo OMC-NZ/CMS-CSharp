@@ -16,16 +16,17 @@ internal sealed class PromotionConflictDetector
             incoming,
             cancellationToken);
 
+        var overlapsByPromotion = await FindOverlappingChannelCodesAsync(
+            connection,
+            transaction,
+            candidates.Select(candidate => candidate.PromotionId).ToArray(),
+            incoming.Channels,
+            cancellationToken);
+
         foreach (var candidate in candidates)
         {
-            var overlappingCodes = await FindOverlappingChannelCodesAsync(
-                connection,
-                transaction,
-                candidate.PromotionId,
-                incoming.Channels,
-                cancellationToken);
-
-            if (overlappingCodes.Count > 0)
+            if (overlapsByPromotion.TryGetValue(candidate.PromotionId, out var overlappingCodes) &&
+                overlappingCodes.Count > 0)
             {
                 return new PromotionConflict(
                     candidate.PromotionId,
@@ -89,55 +90,59 @@ internal sealed class PromotionConflictDetector
         return result;
     }
 
-    private static async Task<IReadOnlyList<string>> FindOverlappingChannelCodesAsync(
+    private static async Task<IReadOnlyDictionary<long, IReadOnlyList<string>>> FindOverlappingChannelCodesAsync(
         MySqlConnection connection,
         MySqlTransaction transaction,
-        long promotionId,
+        IReadOnlyList<long> promotionIds,
         IReadOnlyList<PromotionChannelPeriod> incomingChannels,
         CancellationToken cancellationToken)
     {
-        if (incomingChannels.Count == 0)
-        {
-            return [];
-        }
+        if (incomingChannels.Count == 0 || promotionIds.Count == 0)
+            return new Dictionary<long, IReadOnlyList<string>>();
 
         var periodsByCode = incomingChannels.ToDictionary(
             channel => channel.Code,
             StringComparer.OrdinalIgnoreCase);
         var channelParameters = CreateParameterNames("overlapChannel", incomingChannels.Count);
+        var promotionParameters = CreateParameterNames("overlapPromotion", promotionIds.Count);
 
         await using var command = new MySqlCommand(
             $"""
-            SELECT channel_code, start_date, end_date
+            SELECT promotion_id, channel_code, start_date, end_date
             FROM Promotion_Channels
-            WHERE promotion_id = @promotionId
+            WHERE promotion_id IN ({string.Join(", ", promotionParameters)})
               AND channel_code IN ({string.Join(", ", channelParameters)});
             """,
             connection,
             transaction);
-        command.Parameters.AddWithValue("@promotionId", promotionId);
+        AddParameters(command, promotionParameters, promotionIds.Cast<object>().ToArray());
         AddParameters(
             command,
             channelParameters,
             incomingChannels.Select(channel => (object)channel.Code).ToArray());
 
-        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new Dictionary<long, HashSet<string>>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
-            var code = reader.GetString(0);
-            var existingStart = reader.GetDateTime(1);
-            var existingEnd = reader.GetDateTime(2);
+            var promotionId = reader.GetInt64(0);
+            var code = reader.GetString(1);
+            var existingStart = reader.GetDateTime(2);
+            var existingEnd = reader.GetDateTime(3);
             var incomingPeriod = periodsByCode[code];
 
             if (incomingPeriod.StartDate <= existingEnd &&
                 incomingPeriod.EndDate >= existingStart)
             {
-                result.Add(code);
+                if (!result.TryGetValue(promotionId, out var codes))
+                    result[promotionId] = codes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                codes.Add(code);
             }
         }
 
-        return result.Order(StringComparer.OrdinalIgnoreCase).ToArray();
+        return result.ToDictionary(
+            item => item.Key,
+            item => (IReadOnlyList<string>)item.Value.Order(StringComparer.OrdinalIgnoreCase).ToArray());
     }
 
     private static string[] CreateParameterNames(string prefix, int count) =>
