@@ -196,10 +196,7 @@ app.MapGet("/api/devices/search", async (
             WHERE d.market_name LIKE CONCAT('%', @marketName, '%') ESCAPE '='
               AND d.category = 11
               AND d.redemption_status = 0
-              AND d.channel_code NOT IN (
-                  'OTH', 'SCS', 'CAS', 'DOW', 'GWP', 'HSP', 'LAU',
-                  'MCG', 'OAU', 'PAC', 'REP', 'VDFP', 'VSS', 'APL'
-              )
+              AND LOWER(TRIM(c.category)) IN ('retailer', 'carrier')
             ORDER BY d.market_name, d.model, c.name, c.code;
             """;
         command.Parameters.Add(

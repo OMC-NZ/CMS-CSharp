@@ -360,7 +360,8 @@ Additional filters:
 
 - `category` must be exactly `11`.
 - `redemption_status` must be `0`.
-- `channel_code` values `OTH`, `SCS`, `CAS`, `DOW`, `GWP`, `HSP`, `LAU`, `MCG`, `OAU`, `PAC`, `REP`, `VDFP`, `VSS`, and `APL` are excluded.
+- The related `Channels.category` must be `Retailer` or `Carrier` (case-insensitive).
+- No Channel codes are excluded individually.
 - Devices are joined to `Channels` by `Devices.channel_code = Channels.code`.
 - Duplicate Device results are merged by `market_name + model`.
 - Each Device result contains all distinct matching Channel names and codes.
