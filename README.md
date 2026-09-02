@@ -119,9 +119,9 @@ Matching rules:
 - `Promotions.banner_url` is treated as the stored banner filename and expanded to `{R2_PUBLIC_ASSETS_URL}/banners/Promotions/{banner-file}`. An already absolute banner URL is returned unchanged.
 - The response returns the public image URL; it does not proxy the image binary through this API.
 - Device model, channel code, Promotion description, and Gifts are used or resolved internally as needed but are not included in the response. The queried IMEI is included in the response.
-- Device matching, the two most recent Promotions, and Claim IDs are read in one database command to reduce request latency.
-- `claimIds` contains every `Claims.id` for the queried IMEI, ordered by `created_at` and then ID descending. It is an empty array when the IMEI has no Claim, so its length always equals the number of matching Claims.
-- Each returned Promotion includes the matched `Channels.name` as `channelName` and the corresponding `Promotion_Channels.start_date` and `end_date` formatted as `yyyy-MM-dd HH:mm:ss`. The channel code is not returned.
+- Device matching, the two most recent Promotions, and Claim records are read in one database command to reduce request latency.
+- `claimIds` contains an object with `Claims.id` as `id` and `Claims.status` as `status` for every Claim belonging to the queried IMEI. Items are ordered by `created_at` and then ID descending. It is an empty array when the IMEI has no Claim, so its length always equals the number of matching Claims.
+- Each returned Promotion includes the matched `Channels.name` as `channelName` and the corresponding `Promotion_Channels.start_date`, `end_date`, and `redeem_end_date`, formatted as `yyyy-MM-dd HH:mm:ss`. The response fields are `startDate`, `endDate`, and `redeemEndDate`; the channel code is not returned.
 
 Success response: `200 OK`
 
@@ -129,8 +129,14 @@ Success response: `200 OK`
 {
   "imei": "490154203237518",
   "claimIds": [
-    "OPNZPROCLM-260828-4EUZB66Y",
-    "OPNZPROCLM-260827-8KM80SDG"
+    {
+      "id": "OPNZPROCLM-260828-4EUZB66Y",
+      "status": 1
+    },
+    {
+      "id": "OPNZPROCLM-260827-8KM80SDG",
+      "status": 0
+    }
   ],
   "promotions": [
     {
@@ -139,7 +145,8 @@ Success response: `200 OK`
       "bannerUrl": "https://assets.example.com/banners/Promotions/banner-uuid.webp",
       "channelName": "Spark",
       "startDate": "2026-09-01 00:00:00",
-      "endDate": "2026-09-28 23:59:59"
+      "endDate": "2026-09-28 23:59:59",
+      "redeemEndDate": "2026-10-12 23:59:59"
     }
   ]
 }
@@ -208,7 +215,7 @@ Storage and database behavior:
 - A terms file is renamed to a UUID and uploaded to `terms/Promotions/{uuid}.{extension}`.
 - For a terms file, `Promotions.terms_url` stores its public R2 URL.
 - For text terms, `Promotions.terms_url` stores `/terms`.
-- `Promotions.slug_url` is generated from the promotion name as `/promotions/{name-slug}-{unique-suffix}` and checked against existing promotion slugs before insertion.
+- `Promotions.slug_url` is generated from the promotion name as `{name-slug}-{unique-suffix}` and checked against existing promotion slugs before insertion. The stored value does not include a `/promotions/` prefix.
 - The backend stores `startDate` as `start_date` at `00:00:00` and `endDate` as `end_date` at `23:59:59`.
 - `redeem_end_date` is exactly 14 calendar days after `end_date` and retains `23:59:59` (for example, an `endDate` of `2026-08-31` produces `2026-09-14 23:59:59`).
 - The backend resolves the effective models, channels, channel periods, and gift IDs before inserting the promotion. It runs the reusable conflict detector against existing promotions, then inserts `Promotions` first and uses its generated ID for the related rows.
@@ -226,7 +233,7 @@ Success response: `201 Created`
 {
   "id": 123,
   "name": "OPPO Buds3 Pro for A6 5G Spark Only",
-  "slugUrl": "/promotions/oppo-buds3-pro-for-a6-5g-spark-only-a1b2c3d4",
+  "slugUrl": "oppo-buds3-pro-for-a6-5g-spark-only-a1b2c3d4",
   "termsUrl": "/terms",
   "bannerFileName": "e42f7f58dd3f4de1b06573bd7b8dbb20.webp",
   "productCount": 1,
@@ -249,7 +256,7 @@ Duplicate or overlapping promotion response: `409 Conflict`
   "existingPromotion": {
     "id": 122,
     "name": "Existing promotion",
-    "slugUrl": "/promotions/existing-promotion-a1b2c3d4"
+    "slugUrl": "existing-promotion-a1b2c3d4"
   },
   "overlappingChannelCodes": ["SPK"]
 }
@@ -512,9 +519,9 @@ Development and Production configuration files are ignored by Git and may contai
 | --- | --- |
 | `EMAIL_HOST` | SMTP server hostname. |
 | `EMAIL_PORT` | SMTP server port. |
-| `EMAIL_USER` | SMTP authentication username. |
+| `EMAIL_USER` | SMTP authentication username and customer-service contact shown in Claim confirmation emails. |
 | `EMAIL_PASS` | SMTP authentication password. |
-| `EMAIL_FROM` | Sender address and customer-service contact shown in Claim confirmation emails. |
+| `EMAIL_FROM` | Sender address used in the email `From` header. |
 | `EMAIL_ADMIN` | Administrative recipient for Claim email failure alerts. |
 
 PowerShell environment-variable example:

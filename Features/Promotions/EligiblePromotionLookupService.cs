@@ -44,7 +44,8 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
                 p.banner_url,
                 c.name AS channel_name,
                 MAX(pc.start_date) AS latest_start_date,
-                MAX(pc.end_date) AS latest_end_date
+                MAX(pc.end_date) AS latest_end_date,
+                MAX(pc.redeem_end_date) AS latest_redeem_end_date
             FROM Devices d
             LEFT JOIN Promotion_Devices pd
                 ON pd.eligible_model = d.model
@@ -59,7 +60,7 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
             ORDER BY latest_start_date DESC, latest_end_date DESC, p.id DESC
             LIMIT 2;
 
-            SELECT id
+            SELECT id, status
             FROM Claims
             WHERE imei = @imei
             ORDER BY created_at DESC, id DESC;
@@ -68,7 +69,7 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
         command.Parameters.AddWithValue("@imei", normalizedImei);
 
         var promotions = new List<EligiblePromotionResult>();
-        var claimIds = new List<string>();
+        var claimIds = new List<EligiblePromotionClaimResult>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))
         {
@@ -85,7 +86,8 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
                     BuildBannerUrl(publicAssetsUrl, reader.GetString(3)),
                     reader.GetString(4),
                     reader.GetDateTime(5).ToString("yyyy-MM-dd HH:mm:ss"),
-                    reader.GetDateTime(6).ToString("yyyy-MM-dd HH:mm:ss")));
+                    reader.GetDateTime(6).ToString("yyyy-MM-dd HH:mm:ss"),
+                    reader.GetDateTime(7).ToString("yyyy-MM-dd HH:mm:ss")));
             }
         }
         while (await reader.ReadAsync(cancellationToken));
@@ -94,7 +96,9 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
         {
             while (await reader.ReadAsync(cancellationToken))
             {
-                claimIds.Add(reader.GetString(0));
+                claimIds.Add(new EligiblePromotionClaimResult(
+                    reader.GetString(0),
+                    Convert.ToInt32(reader.GetValue(1))));
             }
         }
 
@@ -136,8 +140,12 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
 
 internal sealed record EligiblePromotionsResult(
     string Imei,
-    IReadOnlyList<string> ClaimIds,
+    IReadOnlyList<EligiblePromotionClaimResult> ClaimIds,
     IReadOnlyList<EligiblePromotionResult> Promotions);
+
+internal sealed record EligiblePromotionClaimResult(
+    string Id,
+    int Status);
 
 internal sealed record EligiblePromotionResult(
     int Id,
@@ -145,4 +153,5 @@ internal sealed record EligiblePromotionResult(
     string BannerUrl,
     string ChannelName,
     string StartDate,
-    string EndDate);
+    string EndDate,
+    string RedeemEndDate);

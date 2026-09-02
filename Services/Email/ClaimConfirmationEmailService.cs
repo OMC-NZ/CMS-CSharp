@@ -152,11 +152,11 @@ internal sealed partial class ClaimConfirmationEmailService(
         };
         message.To.Add(new MailAddress(data.RecipientEmail));
         message.AlternateViews.Add(AlternateView.CreateAlternateViewFromString(
-            BuildText(data, settings.From),
+            BuildText(data, settings.User),
             Encoding.UTF8,
             MediaTypeNames.Text.Plain));
         message.AlternateViews.Add(AlternateView.CreateAlternateViewFromString(
-            BuildHtml(data, settings.From),
+            BuildHtml(data, settings.User),
             Encoding.UTF8,
             MediaTypeNames.Text.Html));
         return message;

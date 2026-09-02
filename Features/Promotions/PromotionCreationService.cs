@@ -398,7 +398,7 @@ internal sealed partial class PromotionCreationService(
         while (true)
         {
             var uniqueSuffix = Guid.NewGuid().ToString("N")[..8];
-            var candidate = $"/promotions/{baseSlug}-{uniqueSuffix}";
+            var candidate = $"{baseSlug}-{uniqueSuffix}";
 
             await using var command = new MySqlCommand(
                 "SELECT 1 FROM Promotions WHERE slug_url = @slugUrl LIMIT 1;",
