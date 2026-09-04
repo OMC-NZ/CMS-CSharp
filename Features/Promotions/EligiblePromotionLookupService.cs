@@ -133,7 +133,11 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
             "TrustServerCertificate=True;", string.Empty, StringComparison.OrdinalIgnoreCase);
         normalized = normalized.Replace(
             "TrustServerCertificate=False;", string.Empty, StringComparison.OrdinalIgnoreCase);
-        return normalized;
+        var builder = new MySqlConnectionStringBuilder(normalized)
+        {
+            TreatTinyAsBoolean = false
+        };
+        return builder.ConnectionString;
     }
 
 }

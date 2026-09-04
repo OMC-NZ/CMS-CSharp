@@ -32,6 +32,8 @@ builder.Services.AddScoped<PromotionConflictDetector>();
 builder.Services.AddScoped<PromotionCreationService>();
 builder.Services.AddScoped<EligiblePromotionLookupService>();
 builder.Services.AddScoped<ClaimCreationService>();
+builder.Services.AddScoped<ClaimListService>();
+builder.Services.AddScoped<ClaimDetailsService>();
 
 if (builder.Environment.IsDevelopment())
 {
@@ -633,6 +635,156 @@ app.MapPost("/api/claims", async (
 })
 .WithName("CreateClaim");
 
+app.MapGet("/api/claims", async (
+    ClaimListService claimListService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        return Results.Ok(await claimListService.GetAllAsync(cancellationToken));
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(exception, "Claim list lookup failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Claim list lookup failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("GetClaims");
+
+app.MapGet("/api/claims/search", async (
+    string? claim_id,
+    ClaimListService claimListService,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(claim_id))
+    {
+        return Results.BadRequest(new { error = "The claim_id query parameter is required." });
+    }
+
+    try
+    {
+        return Results.Ok(await claimListService.SearchByClaimIdAsync(
+            claim_id,
+            cancellationToken));
+    }
+    catch (ClaimValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(exception, "Claim ID search failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Claim ID search failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("SearchClaimsById");
+
+app.MapGet("/api/claims/search/imei", async (
+    string? imei,
+    ClaimListService claimListService,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(imei))
+    {
+        return Results.BadRequest(new { error = "The imei query parameter is required." });
+    }
+
+    try
+    {
+        return Results.Ok(await claimListService.SearchByImeiAsync(imei, cancellationToken));
+    }
+    catch (ClaimValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(exception, "Claim IMEI search failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Claim IMEI search failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("SearchClaimsByImei");
+
+app.MapGet("/api/claims/search/email", async (
+    string? email,
+    ClaimListService claimListService,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(email))
+    {
+        return Results.BadRequest(new { error = "The email query parameter is required." });
+    }
+
+    try
+    {
+        return Results.Ok(await claimListService.SearchByEmailAsync(email, cancellationToken));
+    }
+    catch (ClaimValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(exception, "Claim email search failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Claim email search failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("SearchClaimsByEmail");
+
+app.MapGet("/api/claims/view/{claimId}", async (
+    string claimId,
+    ClaimDetailsService claimDetailsService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var result = await claimDetailsService.FindAsync(claimId, cancellationToken);
+        return result is null
+            ? Results.NotFound(new { error = $"Claim '{claimId.Trim()}' was not found." })
+            : Results.Ok(result);
+    }
+    catch (ClaimValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(exception, "Claim details lookup failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Claim details lookup failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("ViewClaimById");
+
 app.Run();
 
 static IReadOnlyList<T> DeserializeRequiredList<T>(
@@ -677,7 +829,11 @@ static string NormalizeMySqlConnectionString(string connectionString)
         string.Empty,
         StringComparison.OrdinalIgnoreCase);
 
-    return normalized;
+    var builder = new MySqlConnectionStringBuilder(normalized)
+    {
+        TreatTinyAsBoolean = false
+    };
+    return builder.ConnectionString;
 }
 
 static string EscapeLikePattern(string value) => value

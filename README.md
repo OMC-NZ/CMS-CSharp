@@ -81,6 +81,8 @@ Failure response: `503 Service Unavailable`
 
 `ConnectionStrings:DefaultConnection` is the single source for all MySQL connection settings, including server, port, database, user, password, and SSL options. MySqlConnector connection pooling is enabled by default, so opening and disposing connections per request reuses pooled connections efficiently.
 
+The backend forces MySqlConnector `TreatTinyAsBoolean=False` for every connection. This ensures numeric `TINYINT(1)` status columns such as `Claims.status` preserve values such as `2`, `3`, and `4` instead of being converted to Boolean `true` and returned as `1`.
+
 ### Reusable Database Lookups
 
 Reusable lookups for reference tables are defined by `Data/Repositories/IReferenceDataRepository.cs` and implemented in `Data/Repositories/ReferenceDataRepository.cs`. Feature services receive the repository through dependency injection and pass their current MySQL connection and transaction into it. This keeps SQL out of HTTP routes, avoids duplicate lookup code, and allows several writes and lookups to participate in the same transaction.
@@ -266,6 +268,161 @@ Non-multipart request response: `415 Unsupported Media Type`
 
 Database or R2 failure response: `503 Service Unavailable`
 
+### Get Claims
+
+```http
+GET /api/claims
+```
+
+Returns Claims from the start of the previous New Zealand calendar week through the current request time. For example, a request made on Wednesday returns the complete previous Monday-to-Sunday period plus the current Monday through Wednesday up to the request time. Results are ordered by `Claims.created_at` descending and then Claim ID descending.
+
+Rules:
+
+- `claimId` comes from `Claims.id`.
+- `imei` comes from `Claims.imei`.
+- `fullName` combines `Customers.first_name` and `Customers.last_name` with one space.
+- `email` comes from `Customers.email`.
+- `status` and `createdAt` come from `Claims.status` and `Claims.created_at`.
+- `gifts` contains distinct values from Gifts linked through `Claim_Gifts`. Each value is `Gifts.name + space + Gifts.color`; when `color` is empty or equals `Empty` (case-insensitive), only `Gifts.name` is returned. Multiple Gifts do not duplicate the Claim row.
+- `createdAt` is formatted as `yyyy-MM-dd HH:mm:ss`.
+- Week boundaries are calculated in the `Pacific/Auckland` time zone and converted to UTC for comparison with `Claims.created_at`.
+- The endpoint has no pagination input or 50-row limit; it returns every Claim in this date range.
+
+Success response: `200 OK`
+
+```json
+[
+  {
+    "claimId": "OPNZPROCLM-260903-4EUZB66Y",
+    "imei": "490154203237518",
+    "fullName": "Chris Example",
+    "email": "customer@example.com",
+    "status": 0,
+    "gifts": [
+      "OPPO Gift Black"
+    ],
+    "createdAt": "2026-09-03 10:30:00"
+  }
+]
+```
+
+When no Claims exist, the endpoint returns `200 OK` with an empty array.
+
+Database or configuration failure response: `503 Service Unavailable`
+
+### Search Claims by Claim ID
+
+```http
+GET /api/claims/search?claim_id={claimId}
+```
+
+Performs a case-insensitive contains search against `Claims.id` without applying the previous-week/current-week date restriction used by `GET /api/claims`.
+
+Query parameters:
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `claim_id` | Yes | Full or partial Claim ID. `%`, `_`, and the escape character are treated as literal search text. |
+
+The response shape, Gift formatting, deduplication, and ordering are the same as `GET /api/claims`. Results are ordered by `Claims.created_at` descending and then Claim ID descending.
+
+Success response: `200 OK`
+
+```json
+[
+  {
+    "claimId": "OPNZPROCLM-260831-KICYCCH1",
+    "imei": "868874080676538",
+    "fullName": "Chris Example",
+    "email": "customer@example.com",
+    "status": 2,
+    "gifts": [
+      "OPPO Gift Black"
+    ],
+    "createdAt": "2026-08-30 23:32:57"
+  }
+]
+```
+
+No matches response: `200 OK` with an empty array.
+
+Missing or empty `claim_id` response: `400 Bad Request`
+
+Database or configuration failure response: `503 Service Unavailable`
+
+### Search Claims by IMEI
+
+```http
+GET /api/claims/search/imei?imei={imei}
+```
+
+Performs a contains search against `Claims.imei` without a date restriction. The response shape, Gift formatting, deduplication, and ordering are the same as `GET /api/claims`.
+
+The required `imei` parameter may contain a full or partial IMEI. `%`, `_`, and the escape character are treated as literal search text.
+
+Success response: `200 OK`; no matches return an empty array.
+
+Missing or empty `imei` response: `400 Bad Request`
+
+Database or configuration failure response: `503 Service Unavailable`
+
+### Search Claims by Customer Email
+
+```http
+GET /api/claims/search/email?email={email}
+```
+
+Performs a contains search against `Customers.email`, joined through `Claims.customer_id = Customers.id`, without a date restriction. The response shape, Gift formatting, deduplication, and ordering are the same as `GET /api/claims`.
+
+The required `email` parameter may contain a full or partial customer email. `%`, `_`, and the escape character are treated as literal search text.
+
+Success response: `200 OK`; no matches return an empty array.
+
+Missing or empty `email` response: `400 Bad Request`
+
+Database or configuration failure response: `503 Service Unavailable`
+
+### Get Claim Details
+
+```http
+GET /api/claims/view/{claimId}
+```
+
+Returns exactly one Claim matched by `Claims.id`.
+
+Response rules:
+
+- `claimId` comes from `Claims.id`.
+- `contact` comes from the related `Customers.contact`.
+- `fullAddress` combines `street`, `suburb`, `city`, and `postcode` from the latest current `Deliver_Addresses` row.
+- `receiptUrl` and `screenshotUrl` use the filenames from `Claims.receipt_url` and `Claims.screenshot_url`. The backend obtains `Claims.promotion_id` and searches Cloudflare R2 with the prefix `claims/promotions/{promotionId}/{partial-file-name}`. A unique match is returned with its complete UUID filename and extension. Receipt and Screenshot lookups run concurrently.
+- If an older database value contains folders, only its final filename is used for the new Promotion-ID folder lookup. Legacy absolute URLs are returned unchanged. If a prefix finds no object, finds multiple objects, or the R2 lookup fails, the API uses the unresolved Promotion-ID path and logs a warning instead of selecting an uncertain file.
+- `Claims.status` is used internally but is not returned. When it equals `1`, `reference` contains the latest related `Deliveries.reference` and `trackLink` is `null`.
+- When the internal status equals `2`, `reference` contains the latest related `Deliveries.reference` and `trackLink` contains the latest `Track_Trace.track_link` for the current delivery address.
+- For all other internal statuses, `reference` and `trackLink` are `null`.
+- The API returns public file URLs, not image binary data.
+
+Success response: `200 OK`
+
+```json
+{
+  "claimId": "OPNZPROCLM-260903-4EUZB66Y",
+  "promotionName": "Example Promotion",
+  "contact": "0211234567",
+  "fullAddress": "1 Example Street, Newmarket, Auckland, 1023",
+  "receiptUrl": "https://assets.example.com/claims/promotions/123/receipt-uuid.jpg",
+  "screenshotUrl": "https://assets.example.com/claims/promotions/123/screenshot-uuid.png",
+  "reference": "DELIVERY-REFERENCE-123",
+  "trackLink": "https://tracking.example.com/example-reference"
+}
+```
+
+Unknown Claim response: `404 Not Found`
+
+Invalid Claim ID response: `400 Bad Request`
+
+Database or configuration failure response: `503 Service Unavailable`
+
 ### Create Claim
 
 ```http
@@ -318,8 +475,8 @@ Validation and persistence rules:
 - A new `Customers` row is inserted first and its generated ID is stored in `Claims.customer_id`.
 - The Claim ID format is `OPNZPROCLM-yyMMdd-XXXXXXXX`, using the current `Pacific/Auckland` date. The final eight characters are cryptographically generated uppercase letters or digits, and the generated ID is checked against `Claims.id` before use.
 - Receipt and screenshot files are independently renamed to UUID filenames while retaining their validated extensions. The backend validates both the extension and the file signature, rejects files larger than 5 MB, and uploads both files concurrently.
-- Both files are uploaded under `claims/promotions/{promotion-name}/{uuid}.{extension}`. The Promotion name is converted to lowercase, and each sequence of spaces or non-alphanumeric characters is replaced with one `-` (for example, `OPPO Reno Promotion 2026` becomes `oppo-reno-promotion-2026`).
-- Files are uploaded to R2 under `claims/promotions/{promotion-name}/{uuid}.{extension}`, but `Claims.receipt_url` and `Claims.screenshot_url` store only `{promotion-name}/{uuid}.{extension}`. Neither the public domain nor the `claims/promotions/` prefix is stored.
+- Both files are uploaded under `claims/promotions/{promotionId}/{uuid}.{extension}`.
+- `Claims.receipt_url` and `Claims.screenshot_url` store only `{uuid}.{extension}`. The public domain, `claims/promotions/` prefix, and Promotion ID folder are not stored in these columns.
 - `Claims.status` and `Claims.email_status` initially use `0`.
 - Selected Gifts are inserted into `Claim_Gifts`, and the delivery address is inserted into the existing `Deliver_Addresses` table with `is_current = 1`.
 - Before the Claim transaction commits, the matching Device is always updated to `redemption_status = 1`, regardless of its previous value.
@@ -337,8 +494,8 @@ Success response: `201 Created`
   "customerId": 456,
   "imei": "490154203237518",
   "giftIds": [12],
-  "receiptUrl": "example-promotion/uuid.pdf",
-  "screenshotUrl": "example-promotion/uuid.png",
+  "receiptUrl": "uuid.pdf",
+  "screenshotUrl": "uuid.png",
   "emailQueued": true
 }
 ```

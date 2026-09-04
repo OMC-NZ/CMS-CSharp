@@ -16,7 +16,6 @@ internal sealed partial class ClaimCreationService(
 {
     private const string ClaimIdPrefix = "OPNZPROCLM";
     private const string ClaimIdAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    private const string ClaimObjectKeyPrefix = "claims/promotions/";
     private const long ClaimFileMaxBytes = 5 * 1024 * 1024;
 
     public async Task<CreateClaimResult> CreateAsync(
@@ -43,7 +42,7 @@ internal sealed partial class ClaimCreationService(
         try
         {
             var purchaseDate = ParsePurchaseDate(request.PurchaseDate);
-            var promotionName = await GetPromotionNameAsync(
+            _ = await GetPromotionNameAsync(
                 connection,
                 null,
                 request.PromotionId,
@@ -65,8 +64,7 @@ internal sealed partial class ClaimCreationService(
                 null,
                 cancellationToken);
 
-            var promotionPath = SanitizePathSegment(promotionName);
-            var claimFolder = $"claims/promotions/{promotionPath}";
+            var claimFolder = $"claims/promotions/{request.PromotionId}";
             var receiptUploadTask = UploadClaimFileAsync(
                 request.Receipt,
                 claimFolder,
@@ -544,18 +542,8 @@ internal sealed partial class ClaimCreationService(
         }
     }
 
-    private static string SanitizePathSegment(string value)
-    {
-        var sanitized = PromotionFolderRegex()
-            .Replace(value.Trim().ToLowerInvariant(), "-")
-            .Trim('-');
-        return string.IsNullOrWhiteSpace(sanitized) ? "unnamed-promotion" : sanitized;
-    }
-
     private static string ToStoredClaimPath(string objectKey) =>
-        objectKey.StartsWith(ClaimObjectKeyPrefix, StringComparison.Ordinal)
-            ? objectKey[ClaimObjectKeyPrefix.Length..]
-            : objectKey;
+        Path.GetFileName(objectKey.Replace('\\', '/'));
 
 
     private static string NormalizeExtension(string fileName)
@@ -580,10 +568,11 @@ internal sealed partial class ClaimCreationService(
             "TrustServerCertificate=True;", string.Empty, StringComparison.OrdinalIgnoreCase);
         normalized = normalized.Replace(
             "TrustServerCertificate=False;", string.Empty, StringComparison.OrdinalIgnoreCase);
-        return normalized;
+        var builder = new MySqlConnectionStringBuilder(normalized)
+        {
+            TreatTinyAsBoolean = false
+        };
+        return builder.ConnectionString;
     }
-
-    [GeneratedRegex(@"[^a-z0-9]+", RegexOptions.CultureInvariant)]
-    private static partial Regex PromotionFolderRegex();
 
 }

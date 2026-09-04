@@ -365,7 +365,11 @@ internal sealed partial class ClaimConfirmationEmailService(
             "TrustServerCertificate=True;", string.Empty, StringComparison.OrdinalIgnoreCase);
         normalized = normalized.Replace(
             "TrustServerCertificate=False;", string.Empty, StringComparison.OrdinalIgnoreCase);
-        return normalized;
+        var builder = new MySqlConnectionStringBuilder(normalized)
+        {
+            TreatTinyAsBoolean = false
+        };
+        return builder.ConnectionString;
     }
 
     [GeneratedRegex(@"(?i)Server=([^;,]+),(\d+)")]

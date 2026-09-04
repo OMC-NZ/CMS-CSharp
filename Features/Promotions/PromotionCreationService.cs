@@ -501,7 +501,11 @@ internal sealed partial class PromotionCreationService(
             string.Empty,
             StringComparison.OrdinalIgnoreCase);
 
-        return normalized;
+        var builder = new MySqlConnectionStringBuilder(normalized)
+        {
+            TreatTinyAsBoolean = false
+        };
+        return builder.ConnectionString;
     }
 
     [GeneratedRegex(@"[^a-z0-9]+", RegexOptions.CultureInvariant)]

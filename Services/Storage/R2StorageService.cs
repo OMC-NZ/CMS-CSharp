@@ -9,9 +9,13 @@ internal sealed class R2StorageService : IR2StorageService, IDisposable
     private const int CopyBufferSize = 81920;
 
     private readonly Lazy<R2ClientContext> _context;
+    private readonly ILogger<R2StorageService> _logger;
 
-    public R2StorageService(IConfiguration configuration)
+    public R2StorageService(
+        IConfiguration configuration,
+        ILogger<R2StorageService> logger)
     {
+        _logger = logger;
         _context = new Lazy<R2ClientContext>(
             () => CreateContext(configuration),
             LazyThreadSafetyMode.ExecutionAndPublication);
@@ -95,6 +99,75 @@ internal sealed class R2StorageService : IR2StorageService, IDisposable
                 Key = normalizedObjectKey
             },
             cancellationToken);
+    }
+
+    public async Task<string> ResolvePublicUrlByPrefixAsync(
+        string storedValue,
+        string objectKeyPrefix,
+        CancellationToken cancellationToken = default)
+    {
+        if (Uri.TryCreate(storedValue, UriKind.Absolute, out var absoluteUrl))
+        {
+            return absoluteUrl.ToString();
+        }
+
+        var context = _context.Value;
+        var normalizedPrefix = NormalizeObjectKey(objectKeyPrefix).TrimEnd('/') + "/";
+        var normalizedStoredValue = NormalizeObjectKey(storedValue);
+        if (normalizedStoredValue.StartsWith(normalizedPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            normalizedStoredValue = normalizedStoredValue[normalizedPrefix.Length..];
+        }
+
+        var lookupPrefix = normalizedPrefix + normalizedStoredValue;
+        var fallbackUrl = BuildPublicUrl(context.PublicAssetsUrl, lookupPrefix);
+
+        try
+        {
+            var response = await context.Client.ListObjectsV2Async(
+                new ListObjectsV2Request
+                {
+                    BucketName = context.Bucket,
+                    Prefix = lookupPrefix,
+                    MaxKeys = 3
+                },
+                cancellationToken);
+            var matchingKeys = response.S3Objects
+                .Select(item => item.Key)
+                .Where(key => !string.IsNullOrWhiteSpace(key))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+
+            var exactKey = matchingKeys.FirstOrDefault(key =>
+                string.Equals(key, lookupPrefix, StringComparison.Ordinal));
+            if (exactKey is not null)
+            {
+                return BuildPublicUrl(context.PublicAssetsUrl, exactKey);
+            }
+
+            if (matchingKeys.Length == 1)
+            {
+                return BuildPublicUrl(context.PublicAssetsUrl, matchingKeys[0]);
+            }
+
+            _logger.LogWarning(
+                "R2 prefix {Prefix} resolved to {MatchCount} objects; using the stored partial path.",
+                lookupPrefix,
+                matchingKeys.Length);
+            return fallbackUrl;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                exception,
+                "R2 prefix lookup failed for {Prefix}; using the stored partial path.",
+                lookupPrefix);
+            return fallbackUrl;
+        }
     }
 
     public void Dispose()
