@@ -115,13 +115,14 @@ Matching rules:
 
 - `Promotion_Devices.eligible_model` must match the Device model.
 - `Promotion_Channels.channel_code` must match the Device channel code.
-- Channel dates are not used to exclude Promotions. Matching Promotions are ordered by the matched Channel's `start_date` descending, then `end_date` descending, and then Promotion ID descending.
-- The endpoint returns at most the two most recent matching Promotions. It returns one when only one match exists and an empty array when none exist.
+- A matched `Promotion_Channels.end_date` must be on or after the New Zealand current calendar date minus three calendar months. Promotions that ended before that cutoff are excluded; ongoing and future Promotions remain eligible for this lookup.
+- Matching Promotions are ordered by the matched Channel's `start_date` descending, then `end_date` descending, and then Promotion ID descending.
+- The endpoint returns at most the three most recent matching Promotions. It may return one or two when fewer matches exist, and an empty array when none exist.
 - Device category and redemption status are not used as filters.
 - `Promotions.banner_url` is treated as the stored banner filename and expanded to `{R2_PUBLIC_ASSETS_URL}/banners/Promotions/{banner-file}`. An already absolute banner URL is returned unchanged.
 - The response returns the public image URL; it does not proxy the image binary through this API.
 - Device model, channel code, Promotion description, and Gifts are used or resolved internally as needed but are not included in the response. The queried IMEI is included in the response.
-- Device matching, the two most recent Promotions, and Claim records are read in one database command to reduce request latency.
+- Device matching, the three most recent Promotions within the three-month window, and Claim records are read in one database command to reduce request latency.
 - `claimIds` contains an object with `Claims.id` as `id` and `Claims.status` as `status` for every Claim belonging to the queried IMEI. Items are ordered by `created_at` and then ID descending. It is an empty array when the IMEI has no Claim, so its length always equals the number of matching Claims.
 - Each returned Promotion includes the matched `Channels.name` as `channelName` and the corresponding `Promotion_Channels.start_date`, `end_date`, and `redeem_end_date`, formatted as `yyyy-MM-dd HH:mm:ss`. The response fields are `startDate`, `endDate`, and `redeemEndDate`; the channel code is not returned.
 
@@ -423,6 +424,44 @@ Invalid Claim ID response: `400 Bad Request`
 
 Database or configuration failure response: `503 Service Unavailable`
 
+### Delete Claim
+
+```http
+DELETE /api/claims/{claimId}
+```
+
+Deletes one Claim and its directly related records in a single MySQL transaction.
+
+Deletion order and rules:
+
+1. Lock the matching `Claims` row and read its `customer_id`.
+2. Delete all matching `Claim_Gifts` rows by `claim_id`.
+3. Delete all matching `Deliver_Addresses` rows by `claim_id`.
+4. Delete the matching `Claims` row by ID.
+5. Delete the corresponding `Customers` row only when no other Claim still references that Customer.
+
+The endpoint does not delete or update the matching `Devices` row or IMEI. If any database deletion fails, the transaction rolls back all database deletions. After the database transaction commits, Receipt and Screenshot are deleted concurrently from Cloudflare R2 using `claims/promotions/{promotionId}/{stored-file-name}` prefix matching.
+
+MySQL and Cloudflare R2 cannot participate in one shared transaction. If R2 cleanup fails or a stored partial filename does not resolve uniquely, the committed database deletion remains successful, the failed object is not guessed or deleted, and the response reports the cleanup result.
+
+Success response: `200 OK`
+
+```json
+{
+  "success": true,
+  "claimId": "OPNZPROCLM-260903-4EUZB66Y",
+  "assetsCleanupSucceeded": true
+}
+```
+
+Database row counts and the R2 deletion count are written to the backend log and are not exposed in the API response. `success` means the database deletion committed. `assetsCleanupSucceeded` is `true` only when both R2 files were deleted.
+
+Unknown Claim response: `404 Not Found`
+
+Invalid Claim ID response: `400 Bad Request`
+
+Database constraint or connection failure response: `503 Service Unavailable`
+
 ### Create Claim
 
 ```http
@@ -438,7 +477,7 @@ Multipart form fields:
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
-| `promotionId` | Integer | Yes | ID of the selected existing Promotion. The backend reads its name for the R2 folder. |
+| `promotionId` | Integer | Yes | ID of the selected existing Promotion. `0` is the reserved General Case Promotion ID. Negative values are rejected. |
 | `imei` | Text | Yes | An exact 15-digit Device IMEI. |
 | `purchaseDate` | Text | Yes | Purchase date in `yyyy-MM-dd` format. |
 | `firstName` | Text | Yes | Customer first name. |
@@ -449,7 +488,7 @@ Multipart form fields:
 | `suburb` | Text | Yes | Delivery suburb. |
 | `city` | Text | Yes | Delivery city. |
 | `postcode` | Text | Yes | Delivery postcode. |
-| `instructions` | Text | No | Optional delivery instructions. |
+| `instructions` | Text | No | Optional delivery instructions. If omitted, empty, or whitespace-only, the backend stores an empty string (`""`), not `NULL`. |
 | `giftAliases` | JSON array text | Yes | One or more unique Gift aliases selected from the Promotion. |
 | `receipt` | File | Yes | JPG, JPEG, PNG, or PDF file up to 5 MB. |
 | `screenshot` | File | Yes | JPG, JPEG, PNG, or PDF file up to 5 MB. |
@@ -468,10 +507,10 @@ Validation and persistence rules:
 - `email` is trimmed, converted to lowercase, and validated as an email address.
 - All whitespace is removed from `contact`, which must then contain digits only.
 - `postcode` must contain exactly four digits; a leading zero is retained.
-- The Promotion must exist.
+- The Promotion must exist, including the reserved `Promotions.id = 0` row when `promotionId` is `0`.
 - The IMEI must contain exactly 15 digits and exist in `Devices`. Its existing `redemption_status` value is not used to reject the Claim.
 - Device model, channel, and `purchaseDate` are not used to determine Claim eligibility. `purchaseDate` is validated only as `yyyy-MM-dd` and stored in `Claims.purchase_date`.
-- Every Gift alias is resolved to `Gifts.id` and must exist in `Promotion_Gifts` for the selected Promotion.
+- Every Gift alias is resolved to a real `Gifts.id`. For a normal Promotion (`promotionId > 0`), each Gift must also exist in `Promotion_Gifts` for that Promotion. For the General Case (`promotionId = 0`), the `Promotion_Gifts` membership check is skipped, so any existing Gift may be recorded in `Claim_Gifts`.
 - A new `Customers` row is inserted first and its generated ID is stored in `Claims.customer_id`.
 - The Claim ID format is `OPNZPROCLM-yyMMdd-XXXXXXXX`, using the current `Pacific/Auckland` date. The final eight characters are cryptographically generated uppercase letters or digits, and the generated ID is checked against `Claims.id` before use.
 - Receipt and screenshot files are independently renamed to UUID filenames while retaining their validated extensions. The backend validates both the extension and the file signature, rejects files larger than 5 MB, and uploads both files concurrently.

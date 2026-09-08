@@ -157,7 +157,7 @@ internal sealed partial class ClaimCreationService(
                 ("@city", request.City.Trim()),
                 ("@postcode", request.Postcode.Trim()),
                 ("@instructions", string.IsNullOrWhiteSpace(request.Instructions)
-                    ? DBNull.Value
+                    ? string.Empty
                     : request.Instructions.Trim()),
                 ("@updatedAt", now));
 
@@ -236,7 +236,7 @@ internal sealed partial class ClaimCreationService(
                     FROM Promotion_Gifts pg
                     WHERE pg.promotion_id = @promotionId
                       AND pg.gift_id = g.id
-                ) AS is_available
+                ) OR @promotionId = 0 AS is_available
             FROM Gifts g
             WHERE g.alias IN ({string.Join(", ", aliasParameters)});
             """,
@@ -470,9 +470,9 @@ internal sealed partial class ClaimCreationService(
             throw new ClaimValidationException(exception.Message);
         }
 
-        if (normalized.PromotionId <= 0)
+        if (normalized.PromotionId < 0)
         {
-            throw new ClaimValidationException("promotionId must be a positive integer.");
+            throw new ClaimValidationException("promotionId must be zero or a positive integer.");
         }
 
         if (normalized.GiftAliases.Count == 0 ||

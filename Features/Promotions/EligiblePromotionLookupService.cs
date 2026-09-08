@@ -35,6 +35,12 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
             NormalizeMySqlConnectionString(connectionString));
         await connection.OpenAsync(cancellationToken);
 
+        var newZealandTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Pacific/Auckland");
+        var currentNewZealandDate = TimeZoneInfo.ConvertTimeFromUtc(
+            DateTime.UtcNow,
+            newZealandTimeZone).Date;
+        var threeMonthCutoff = currentNewZealandDate.AddMonths(-3);
+
         await using var command = new MySqlCommand(
             """
             SELECT
@@ -52,13 +58,15 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
             LEFT JOIN Promotions p
                 ON p.id = pd.promotion_id
             LEFT JOIN Promotion_Channels pc
-                ON pc.promotion_id = p.id AND pc.channel_code = d.channel_code
+                ON pc.promotion_id = p.id
+                AND pc.channel_code = d.channel_code
+                AND pc.end_date >= @threeMonthCutoff
             LEFT JOIN Channels c
                 ON c.code = pc.channel_code
             WHERE d.imei = @imei
             GROUP BY d.imei, p.id, p.name, p.banner_url, c.name
             ORDER BY latest_start_date DESC, latest_end_date DESC, p.id DESC
-            LIMIT 2;
+            LIMIT 3;
 
             SELECT id, status
             FROM Claims
@@ -67,6 +75,7 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
             """,
             connection);
         command.Parameters.AddWithValue("@imei", normalizedImei);
+        command.Parameters.AddWithValue("@threeMonthCutoff", threeMonthCutoff);
 
         var promotions = new List<EligiblePromotionResult>();
         var claimIds = new List<EligiblePromotionClaimResult>();

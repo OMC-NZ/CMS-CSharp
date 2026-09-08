@@ -170,6 +170,64 @@ internal sealed class R2StorageService : IR2StorageService, IDisposable
         }
     }
 
+    public async Task<bool> DeleteByPrefixAsync(
+        string storedValue,
+        string objectKeyPrefix,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var context = _context.Value;
+            var normalizedPrefix = NormalizeObjectKey(objectKeyPrefix).TrimEnd('/') + "/";
+            var storedPath = Uri.TryCreate(storedValue, UriKind.Absolute, out var absoluteUrl)
+                ? Uri.UnescapeDataString(absoluteUrl.AbsolutePath).TrimStart('/')
+                : NormalizeObjectKey(storedValue);
+            var fileName = Path.GetFileName(storedPath.Replace('\\', '/'));
+            var lookupPrefix = normalizedPrefix + fileName;
+
+            var response = await context.Client.ListObjectsV2Async(
+                new ListObjectsV2Request
+                {
+                    BucketName = context.Bucket,
+                    Prefix = lookupPrefix,
+                    MaxKeys = 3
+                },
+                cancellationToken);
+            var matchingKeys = response.S3Objects
+                .Select(item => item.Key)
+                .Where(key => !string.IsNullOrWhiteSpace(key))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var objectKey = matchingKeys.FirstOrDefault(key =>
+                    string.Equals(key, lookupPrefix, StringComparison.Ordinal))
+                ?? (matchingKeys.Length == 1 ? matchingKeys[0] : null);
+
+            if (objectKey is null)
+            {
+                _logger.LogWarning(
+                    "R2 delete prefix {Prefix} resolved to {MatchCount} objects; no object was deleted.",
+                    lookupPrefix,
+                    matchingKeys.Length);
+                return false;
+            }
+
+            await DeleteAsync(objectKey, cancellationToken);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            _logger.LogError(
+                exception,
+                "R2 object deletion failed for stored value {StoredValue}.",
+                storedValue);
+            return false;
+        }
+    }
+
     public void Dispose()
     {
         if (_context.IsValueCreated)

@@ -34,6 +34,7 @@ builder.Services.AddScoped<EligiblePromotionLookupService>();
 builder.Services.AddScoped<ClaimCreationService>();
 builder.Services.AddScoped<ClaimListService>();
 builder.Services.AddScoped<ClaimDetailsService>();
+builder.Services.AddScoped<ClaimDeletionService>();
 
 if (builder.Environment.IsDevelopment())
 {
@@ -784,6 +785,36 @@ app.MapGet("/api/claims/view/{claimId}", async (
     }
 })
 .WithName("ViewClaimById");
+
+app.MapDelete("/api/claims/{claimId}", async (
+    string claimId,
+    ClaimDeletionService claimDeletionService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var result = await claimDeletionService.DeleteAsync(claimId, cancellationToken);
+        return result is null
+            ? Results.NotFound(new { error = $"Claim '{claimId.Trim()}' was not found." })
+            : Results.Ok(result);
+    }
+    catch (ClaimValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogError(exception, "Claim deletion failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Claim deletion failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("DeleteClaimById");
 
 app.Run();
 

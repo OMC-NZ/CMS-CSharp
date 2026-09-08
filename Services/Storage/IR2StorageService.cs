@@ -16,4 +16,9 @@ internal interface IR2StorageService
         string storedValue,
         string objectKeyPrefix,
         CancellationToken cancellationToken = default);
+
+    Task<bool> DeleteByPrefixAsync(
+        string storedValue,
+        string objectKeyPrefix,
+        CancellationToken cancellationToken = default);
 }
