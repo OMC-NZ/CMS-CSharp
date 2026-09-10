@@ -142,7 +142,9 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
                     reader.GetString("full_name"),
                     reader.GetString("email"),
                     Convert.ToInt32(reader.GetValue(reader.GetOrdinal("status"))),
-                    reader.GetDateTime("created_at"));
+                    reader.IsDBNull(reader.GetOrdinal("created_at"))
+                        ? null
+                        : reader.GetDateTime("created_at"));
                 claims.Add(claimId, claim);
             }
 
@@ -160,7 +162,7 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
                 claim.Email,
                 claim.Status,
                 claim.Gifts.Order(StringComparer.OrdinalIgnoreCase).ToArray(),
-                claim.CreatedAt.ToString("yyyy-MM-dd HH:mm:ss")))
+                claim.CreatedAt?.ToString("yyyy-MM-dd HH:mm:ss")))
             .ToArray();
     }
 
@@ -196,7 +198,7 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
         string FullName,
         string Email,
         int Status,
-        DateTime CreatedAt)
+        DateTime? CreatedAt)
     {
         public HashSet<string> Gifts { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
@@ -209,4 +211,4 @@ internal sealed record ClaimListResult(
     string Email,
     int Status,
     IReadOnlyList<string> Gifts,
-    string CreatedAt);
+    string? CreatedAt);

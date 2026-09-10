@@ -1,6 +1,7 @@
 using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
+using System.Security.Cryptography;
 
 namespace CMS_CSharp.Services.Storage;
 
@@ -225,6 +226,81 @@ internal sealed class R2StorageService : IR2StorageService, IDisposable
                 "R2 object deletion failed for stored value {StoredValue}.",
                 storedValue);
             return false;
+        }
+    }
+
+    public async Task<R2ResolvedAsset> ResolvePublicAssetByPrefixAsync(
+        string storedValue,
+        string objectKeyPrefix,
+        CancellationToken cancellationToken = default)
+    {
+        if (Uri.TryCreate(storedValue, UriKind.Absolute, out var absoluteUrl))
+        {
+            return new R2ResolvedAsset(absoluteUrl.ToString(), null);
+        }
+
+        var context = _context.Value;
+        var normalizedPrefix = NormalizeObjectKey(objectKeyPrefix).TrimEnd('/') + "/";
+        var normalizedStoredValue = NormalizeObjectKey(storedValue);
+        if (normalizedStoredValue.StartsWith(normalizedPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            normalizedStoredValue = normalizedStoredValue[normalizedPrefix.Length..];
+        }
+
+        var lookupPrefix = normalizedPrefix + normalizedStoredValue;
+        var fallbackUrl = BuildPublicUrl(context.PublicAssetsUrl, lookupPrefix);
+
+        try
+        {
+            var listResponse = await context.Client.ListObjectsV2Async(
+                new ListObjectsV2Request
+                {
+                    BucketName = context.Bucket,
+                    Prefix = lookupPrefix,
+                    MaxKeys = 3
+                },
+                cancellationToken);
+            var matchingKeys = listResponse.S3Objects
+                .Select(item => item.Key)
+                .Where(key => !string.IsNullOrWhiteSpace(key))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var objectKey = matchingKeys.FirstOrDefault(key =>
+                    string.Equals(key, lookupPrefix, StringComparison.Ordinal))
+                ?? (matchingKeys.Length == 1 ? matchingKeys[0] : null);
+
+            if (objectKey is null)
+            {
+                _logger.LogWarning(
+                    "R2 prefix {Prefix} resolved to {MatchCount} objects; SHA-256 is unavailable.",
+                    lookupPrefix,
+                    matchingKeys.Length);
+                return new R2ResolvedAsset(fallbackUrl, null);
+            }
+
+            using var response = await context.Client.GetObjectAsync(
+                new GetObjectRequest
+                {
+                    BucketName = context.Bucket,
+                    Key = objectKey
+                },
+                cancellationToken);
+            var hash = await SHA256.HashDataAsync(response.ResponseStream, cancellationToken);
+            return new R2ResolvedAsset(
+                BuildPublicUrl(context.PublicAssetsUrl, objectKey),
+                Convert.ToHexStringLower(hash));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                exception,
+                "R2 asset lookup or SHA-256 calculation failed for {Prefix}.",
+                lookupPrefix);
+            return new R2ResolvedAsset(fallbackUrl, null);
         }
     }
 

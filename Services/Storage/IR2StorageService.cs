@@ -17,6 +17,11 @@ internal interface IR2StorageService
         string objectKeyPrefix,
         CancellationToken cancellationToken = default);
 
+    Task<R2ResolvedAsset> ResolvePublicAssetByPrefixAsync(
+        string storedValue,
+        string objectKeyPrefix,
+        CancellationToken cancellationToken = default);
+
     Task<bool> DeleteByPrefixAsync(
         string storedValue,
         string objectKeyPrefix,

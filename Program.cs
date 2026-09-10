@@ -30,10 +30,13 @@ builder.Services.AddHostedService(serviceProvider =>
 builder.Services.AddScoped<IReferenceDataRepository, ReferenceDataRepository>();
 builder.Services.AddScoped<PromotionConflictDetector>();
 builder.Services.AddScoped<PromotionCreationService>();
+builder.Services.AddScoped<PromotionListService>();
+builder.Services.AddScoped<PromotionDetailsService>();
 builder.Services.AddScoped<EligiblePromotionLookupService>();
 builder.Services.AddScoped<ClaimCreationService>();
 builder.Services.AddScoped<ClaimListService>();
 builder.Services.AddScoped<ClaimDetailsService>();
+builder.Services.AddScoped<ClaimUpdateService>();
 builder.Services.AddScoped<ClaimDeletionService>();
 
 if (builder.Environment.IsDevelopment())
@@ -461,6 +464,56 @@ app.MapGet("/api/gifts/search", async (
 })
 .WithName("SearchGiftsByName");
 
+app.MapGet("/api/promotions", async (
+    PromotionListService promotionListService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        return Results.Ok(await promotionListService.GetAsync(cancellationToken));
+    }
+    catch (Exception exception)
+    {
+        app.Logger.LogError(exception, "Promotion list lookup failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Promotion list lookup failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("GetPromotions");
+
+app.MapGet("/api/promotions/{promotionId:int}", async (
+    int promotionId,
+    PromotionDetailsService promotionDetailsService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var result = await promotionDetailsService.FindAsync(promotionId, cancellationToken);
+        return result is null
+            ? Results.NotFound(new { error = $"Promotion '{promotionId}' was not found." })
+            : Results.Ok(result);
+    }
+    catch (PromotionValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception)
+    {
+        app.Logger.LogError(exception, "Promotion details lookup failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Promotion details lookup failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("GetPromotionById");
+
 app.MapPost("/api/promotions", async (
     HttpRequest httpRequest,
     PromotionCreationService promotionCreationService,
@@ -786,6 +839,60 @@ app.MapGet("/api/claims/view/{claimId}", async (
 })
 .WithName("ViewClaimById");
 
+app.MapPatch("/api/claims/{claimId}", async (
+    string claimId,
+    HttpRequest httpRequest,
+    ClaimUpdateService claimUpdateService,
+    CancellationToken cancellationToken) =>
+{
+    if (!httpRequest.HasFormContentType)
+    {
+        return Results.Json(new
+        {
+            error = "Content-Type must be multipart/form-data."
+        }, statusCode: StatusCodes.Status415UnsupportedMediaType);
+    }
+
+    try
+    {
+        var form = await httpRequest.ReadFormAsync(cancellationToken);
+        var command = new UpdateClaimCommand(
+            claimId,
+            GetOptionalFormValue(form, "email"),
+            GetOptionalFormValue(form, "contact"),
+            GetOptionalFormValue(form, "street"),
+            GetOptionalFormValue(form, "suburb"),
+            GetOptionalFormValue(form, "city"),
+            GetOptionalFormValue(form, "postcode"),
+            form.ContainsKey("instructions") ? form["instructions"].ToString() : null,
+            form.ContainsKey("instructions"),
+            DeserializeOptionalList<string>(form, "giftAliases"),
+            form.Files.GetFile("receipt"),
+            form.Files.GetFile("imeiCopy"));
+
+        var result = await claimUpdateService.UpdateAsync(command, cancellationToken);
+        return result is null
+            ? Results.NotFound(new { error = $"Claim '{claimId.Trim()}' was not found." })
+            : Results.Ok(result);
+    }
+    catch (Exception exception) when (
+        exception is ClaimValidationException or JsonException)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception)
+    {
+        app.Logger.LogError(exception, "Claim update failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Claim update failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("UpdateClaimById");
+
 app.MapDelete("/api/claims/{claimId}", async (
     string claimId,
     ClaimDeletionService claimDeletionService,
@@ -835,6 +942,32 @@ static IReadOnlyList<T> DeserializeRequiredList<T>(
         ?? throw new PromotionValidationException(
             $"The {fieldName} form field must be a JSON array.");
 }
+
+static IReadOnlyList<T>? DeserializeOptionalList<T>(
+    IFormCollection form,
+    string fieldName)
+{
+    if (!form.ContainsKey(fieldName))
+    {
+        return null;
+    }
+
+    var json = form[fieldName].ToString();
+    if (string.IsNullOrWhiteSpace(json))
+    {
+        throw new ClaimValidationException(
+            $"The {fieldName} form field must be a JSON array when provided.");
+    }
+
+    return JsonSerializer.Deserialize<List<T>>(
+        json,
+        new JsonSerializerOptions(JsonSerializerDefaults.Web))
+        ?? throw new ClaimValidationException(
+            $"The {fieldName} form field must be a JSON array.");
+}
+
+static string? GetOptionalFormValue(IFormCollection form, string fieldName) =>
+    form.ContainsKey(fieldName) ? form[fieldName].ToString() : null;
 
 static string NormalizeMySqlConnectionString(string connectionString)
 {

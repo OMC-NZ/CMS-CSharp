@@ -163,6 +163,99 @@ Unknown IMEI response: `404 Not Found`
 
 Database or configuration failure response: `503 Service Unavailable`
 
+### List Promotions
+
+```http
+GET /api/promotions
+```
+
+Returns the latest 15 normal Promotions for display without query parameters. The reserved General Case Promotion (`Promotions.id = 0`) is excluded. "Latest" means the highest `Promotions.id` values, ordered descending. No date window is applied.
+
+Data and aggregation rules:
+
+- `promotionId`, `name`, and the stored Banner filename come from `Promotions`.
+- `bannerUrl` is a complete clickable URL under `{R2_PUBLIC_ASSETS_URL}/banners/Promotions/{banner-file}`. An already absolute database URL is returned unchanged; the API does not proxy the image binary.
+- `channelCategories` contains distinct `Channels.category` values joined through `Promotion_Channels.channel_code = Channels.code`. Ten Channels with the same Category therefore return that Category only once.
+- `marketNames` contains distinct `Devices.market_name` values joined through `Promotion_Devices.eligible_model = Devices.model`. Empty values and `temp` are excluded after trimming and case-insensitive comparison.
+- `gifts` contains objects joined through `Promotion_Gifts` and `Gifts`. Each object's `name` is the display value `Gifts.name + " " + Gifts.color`; when color is empty or equals `Empty` case-insensitively, it contains only `Gifts.name`. The object's `alias` comes from the unique `Gifts.alias` and can be sent back by an edit form.
+- Related values are returned as arrays and are empty when the Promotion has no matching rows. All relationship queries are limited to the same latest 15 Promotion IDs, and the separate queries avoid multiplication caused by joining several many-to-many relationships together.
+
+Success response: `200 OK`
+
+```json
+[
+  {
+    "promotionId": 123,
+    "name": "Example Promotion",
+    "bannerUrl": "https://assets.example.com/banners/Promotions/banner-uuid.webp",
+    "channelCategories": ["Carrier", "Retailer"],
+    "marketNames": ["Find X8 Pro", "Reno14"],
+    "gifts": [
+      {
+        "name": "OPPO Watch X2 Black",
+        "alias": "WATCH X2 BLACK"
+      },
+      {
+        "name": "Travel Bag",
+        "alias": "TRAVEL BAG"
+      }
+    ]
+  }
+]
+```
+
+No matching Promotions response: `200 OK` with `[]`
+
+Database, R2 public URL configuration, or connection failure response: `503 Service Unavailable`
+
+### Get Promotion Details
+
+```http
+GET /api/promotions/{promotionId}
+```
+
+Returns one Promotion and the related Channel periods and eligible Device models for the exact numeric Promotion ID. No date window is applied.
+
+Response rules:
+
+- `promotionId`, `description`, `slugUrl`, and `termsUrl` come from `Promotions.id`, `description`, `slug_url`, and `terms_url`.
+- `slugUrl` is returned exactly as stored and does not receive a `/promotions/` prefix.
+- `termsUrl` is returned exactly as stored. It may be `/terms` or the complete public R2 URL of an uploaded Terms file.
+- `channels` joins `Promotion_Channels.channel_code` to `Channels.code` and returns `Channels.name`, `Promotion_Channels.start_date`, and `end_date`. `redeem_end_date` and channel code are not returned.
+- `devices` joins `Promotion_Devices.eligible_model` to `Devices.model` and returns distinct `Devices.market_name` and `Promotion_Devices.eligible_model` as `marketName` and `model`.
+- Device market names that are empty or equal `temp` after trimming and case-insensitive comparison are excluded.
+- Dates use `yyyy-MM-dd HH:mm:ss`. Related collections are empty arrays when no rows match.
+
+Success response: `200 OK`
+
+```json
+{
+  "promotionId": 123,
+  "description": "Example promotion description",
+  "slugUrl": "example-promotion-a1b2c3d4",
+  "termsUrl": "/terms",
+  "channels": [
+    {
+      "name": "Example Retailer",
+      "startDate": "2026-09-01 00:00:00",
+      "endDate": "2026-09-30 23:59:59"
+    }
+  ],
+  "devices": [
+    {
+      "marketName": "Find X8 Pro",
+      "model": "CPH2659"
+    }
+  ]
+}
+```
+
+Negative Promotion ID response: `400 Bad Request`
+
+Unknown Promotion response: `404 Not Found`
+
+Database, configuration, or connection failure response: `503 Service Unavailable`
+
 ### Create Promotion
 
 ```http
@@ -285,7 +378,7 @@ Rules:
 - `email` comes from `Customers.email`.
 - `status` and `createdAt` come from `Claims.status` and `Claims.created_at`.
 - `gifts` contains distinct values from Gifts linked through `Claim_Gifts`. Each value is `Gifts.name + space + Gifts.color`; when `color` is empty or equals `Empty` (case-insensitive), only `Gifts.name` is returned. Multiple Gifts do not duplicate the Claim row.
-- `createdAt` is formatted as `yyyy-MM-dd HH:mm:ss`.
+- `createdAt` is formatted as `yyyy-MM-dd HH:mm:ss`. Historical rows whose `Claims.created_at` is database `NULL` return `createdAt: null` instead of failing the request.
 - Week boundaries are calculated in the `Pacific/Auckland` time zone and converted to UTC for comparison with `Claims.created_at`.
 - The endpoint has no pagination input or 50-row limit; it returns every Claim in this date range.
 
@@ -394,9 +487,11 @@ Returns exactly one Claim matched by `Claims.id`.
 Response rules:
 
 - `claimId` comes from `Claims.id`.
-- `contact` comes from the related `Customers.contact`.
-- `fullAddress` combines `street`, `suburb`, `city`, and `postcode` from the latest current `Deliver_Addresses` row.
-- `receiptUrl` and `screenshotUrl` use the filenames from `Claims.receipt_url` and `Claims.screenshot_url`. The backend obtains `Claims.promotion_id` and searches Cloudflare R2 with the prefix `claims/promotions/{promotionId}/{partial-file-name}`. A unique match is returned with its complete UUID filename and extension. Receipt and Screenshot lookups run concurrently.
+- `email` and `contact` come from the related `Customers` row.
+- `street`, `suburb`, `city`, `postcode`, and `instructions` come from the latest current `Deliver_Addresses` row. Missing or database `NULL` values are returned as empty strings. `fullAddress` is also retained as the combined display value.
+- `giftAliases` contains every related `Gifts.alias` found through `Claim_Gifts`; no Gift returns an empty array.
+- `receiptUrl` and `imeiCopyUrl` use the filenames from `Claims.receipt_url` and `Claims.screenshot_url`. The backend obtains `Claims.promotion_id` and searches Cloudflare R2 with the prefix `claims/promotions/{promotionId}/{partial-file-name}`. A unique match is returned with its complete UUID filename and extension. Both lookups run concurrently.
+- `receiptSha256` and `imeiCopySha256` are lowercase SHA-256 hashes calculated from the resolved R2 object contents. They are `null` for legacy absolute URLs, unresolved or ambiguous object prefixes, or an R2 read failure.
 - If an older database value contains folders, only its final filename is used for the new Promotion-ID folder lookup. Legacy absolute URLs are returned unchanged. If a prefix finds no object, finds multiple objects, or the R2 lookup fails, the API uses the unresolved Promotion-ID path and logs a warning instead of selecting an uncertain file.
 - `Claims.status` is used internally but is not returned. When it equals `1`, `reference` contains the latest related `Deliveries.reference` and `trackLink` is `null`.
 - When the internal status equals `2`, `reference` contains the latest related `Deliveries.reference` and `trackLink` contains the latest `Track_Trace.track_link` for the current delivery address.
@@ -409,10 +504,19 @@ Success response: `200 OK`
 {
   "claimId": "OPNZPROCLM-260903-4EUZB66Y",
   "promotionName": "Example Promotion",
+  "email": "customer@example.com",
   "contact": "0211234567",
+  "street": "1 Example Street",
+  "suburb": "Newmarket",
+  "city": "Auckland",
+  "postcode": "1023",
+  "instructions": "Leave at reception",
   "fullAddress": "1 Example Street, Newmarket, Auckland, 1023",
+  "giftAliases": ["ENCO BUDS3PRO WHITE"],
   "receiptUrl": "https://assets.example.com/claims/promotions/123/receipt-uuid.jpg",
-  "screenshotUrl": "https://assets.example.com/claims/promotions/123/screenshot-uuid.png",
+  "receiptSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "imeiCopyUrl": "https://assets.example.com/claims/promotions/123/imei-copy-uuid.png",
+  "imeiCopySha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "reference": "DELIVERY-REFERENCE-123",
   "trackLink": "https://tracking.example.com/example-reference"
 }
@@ -423,6 +527,53 @@ Unknown Claim response: `404 Not Found`
 Invalid Claim ID response: `400 Bad Request`
 
 Database or configuration failure response: `503 Service Unavailable`
+
+### Update Claim
+
+```http
+PATCH /api/claims/{claimId}
+Content-Type: multipart/form-data
+```
+
+Partially updates one Claim and its related Customer, current delivery address, Gifts, and R2 assets. Only submitted fields are changed.
+
+Multipart form fields:
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `email` | Text | No | Replaces the related `Customers.email`; normalized and validated like Claim creation. |
+| `contact` | Text | No | Replaces `Customers.contact`; whitespace is removed and the result must contain digits only. |
+| `street` | Text | No | Replaces the current delivery address street. |
+| `suburb` | Text | No | Replaces the current delivery address suburb. |
+| `city` | Text | No | Replaces the current delivery address city. |
+| `postcode` | Text | No | Replaces the current delivery postcode and must contain exactly four digits. |
+| `instructions` | Text | No | Replaces delivery instructions. An explicitly submitted empty value is stored as `""`; omission leaves the existing value unchanged. |
+| `giftAliases` | JSON array text | No | Replaces all existing `Claim_Gifts`. When supplied, the array must contain at least one unique Gift alias. |
+| `receipt` | File | No | Replaces the existing Receipt with a UUID-named JPG, JPEG, PNG, or PDF file up to 5 MB. |
+| `imeiCopy` | File | No | Replaces the existing IMEI-copy image stored through `Claims.screenshot_url`; accepts JPG, JPEG, PNG, or PDF up to 5 MB. |
+
+At least one field or replacement file must be supplied. Gift aliases are resolved to real `Gifts.id` values. For Claims with `promotion_id > 0`, each Gift must belong to that Promotion; for the General Case with `promotion_id = 0`, Promotion-Gift membership is not checked.
+
+Replacement files are uploaded to `claims/promotions/{promotionId}/{uuid}.{extension}`. The database continues to store only the UUID filename and extension. Database changes are transactional. A newly uploaded file is removed if the database update fails; after a successful commit, the old corresponding R2 file is deleted. Omitting a file keeps the existing file unchanged.
+
+The endpoint does not change the Claim ID, Promotion ID, IMEI, purchase date, Claim status, email status, customer name, or Device row.
+
+Success response: `200 OK`
+
+```json
+{
+  "success": true,
+  "claimId": "OPNZPROCLM-260903-4EUZB66Y"
+}
+```
+
+Invalid fields, files, Gifts, or an empty update response: `400 Bad Request`
+
+Unknown Claim response: `404 Not Found`
+
+Wrong content type response: `415 Unsupported Media Type`
+
+Database, configuration, or R2 failure response: `503 Service Unavailable`
 
 ### Delete Claim
 
