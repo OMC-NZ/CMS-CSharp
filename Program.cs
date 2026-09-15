@@ -36,6 +36,7 @@ builder.Services.AddScoped<EligiblePromotionLookupService>();
 builder.Services.AddScoped<ClaimCreationService>();
 builder.Services.AddScoped<ClaimListService>();
 builder.Services.AddScoped<ClaimDetailsService>();
+builder.Services.AddScoped<ClaimFulfilmentService>();
 builder.Services.AddScoped<ClaimUpdateService>();
 builder.Services.AddScoped<ClaimDeletionService>();
 
@@ -809,6 +810,38 @@ app.MapGet("/api/claims/search/email", async (
 })
 .WithName("SearchClaimsByEmail");
 
+app.MapGet("/api/claims/search/reference", async (
+    string? reference,
+    ClaimListService claimListService,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(reference))
+    {
+        return Results.BadRequest(new { error = "The reference query parameter is required." });
+    }
+
+    try
+    {
+        return Results.Ok(await claimListService.SearchByReferenceAsync(reference, cancellationToken));
+    }
+    catch (ClaimValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(exception, "Claim reference search failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Claim reference search failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("SearchClaimsByReference");
+
 app.MapGet("/api/claims/view/{claimId}", async (
     string claimId,
     ClaimDetailsService claimDetailsService,
@@ -838,6 +871,68 @@ app.MapGet("/api/claims/view/{claimId}", async (
     }
 })
 .WithName("ViewClaimById");
+
+app.MapGet("/api/claims/fulfilment", async (
+    string[]? claimIds,
+    ClaimFulfilmentService claimFulfilmentService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var requestedIds = (claimIds ?? [])
+            .SelectMany(value => value.Split(',', StringSplitOptions.RemoveEmptyEntries))
+            .ToArray();
+        return Results.Ok(await claimFulfilmentService.FindManyAsync(
+            requestedIds,
+            cancellationToken));
+    }
+    catch (ClaimValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(exception, "Batch Claim fulfilment lookup failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Batch Claim fulfilment lookup failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("GetClaimFulfilmentByIds");
+
+app.MapGet("/api/claims/fulfilment/{claimId}", async (
+    string claimId,
+    ClaimFulfilmentService claimFulfilmentService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var results = await claimFulfilmentService.FindAsync(claimId, cancellationToken);
+        return results.Count == 0
+            ? Results.NotFound(new { error = $"Claim '{claimId.Trim()}' was not found or has no Gift." })
+            : Results.Ok(results);
+    }
+    catch (ClaimValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(exception, "Claim fulfilment lookup failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Claim fulfilment lookup failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("GetClaimFulfilmentById");
 
 app.MapPatch("/api/claims/{claimId}", async (
     string claimId,

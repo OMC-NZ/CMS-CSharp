@@ -368,7 +368,7 @@ Database or R2 failure response: `503 Service Unavailable`
 GET /api/claims
 ```
 
-Returns Claims from the start of the previous New Zealand calendar week through the current request time. For example, a request made on Wednesday returns the complete previous Monday-to-Sunday period plus the current Monday through Wednesday up to the request time. Results are ordered by `Claims.created_at` descending and then Claim ID descending.
+Returns the union of (1) Claims created from the start of the previous New Zealand calendar week through the current request time and (2) all Claims whose current `Claims.status` equals `0`, regardless of creation date. For example, a request made on Wednesday returns the complete previous Monday-to-Sunday period, the current Monday through Wednesday up to the request time, and any older unresolved status-0 Claims. A Claim matching both rules is returned only once. Results are ordered by `Claims.created_at` descending and then Claim ID descending.
 
 Rules:
 
@@ -379,7 +379,7 @@ Rules:
 - `status` and `createdAt` come from `Claims.status` and `Claims.created_at`.
 - `gifts` contains distinct values from Gifts linked through `Claim_Gifts`. Each value is `Gifts.name + space + Gifts.color`; when `color` is empty or equals `Empty` (case-insensitive), only `Gifts.name` is returned. Multiple Gifts do not duplicate the Claim row.
 - `createdAt` is formatted as `yyyy-MM-dd HH:mm:ss`. Historical rows whose `Claims.created_at` is database `NULL` return `createdAt: null` instead of failing the request.
-- Week boundaries are calculated in the `Pacific/Auckland` time zone and converted to UTC for comparison with `Claims.created_at`.
+- Week boundaries are calculated in the `Pacific/Auckland` time zone and converted to UTC for comparison with `Claims.created_at`. The date boundary does not apply to status-0 Claims.
 - The endpoint has no pagination input or 50-row limit; it returns every Claim in this date range.
 
 Success response: `200 OK`
@@ -476,6 +476,22 @@ Missing or empty `email` response: `400 Bad Request`
 
 Database or configuration failure response: `503 Service Unavailable`
 
+### Search Claims by Delivery Reference
+
+```http
+GET /api/claims/search/reference?reference={reference}
+```
+
+Performs a contains search against `Deliveries.reference`, matched through `Deliveries.claim_id = Claims.id`, without a date or Claim-status restriction. Any matching Delivery reference qualifies its Claim; multiple matching Delivery rows do not duplicate the Claim. The required `reference` parameter accepts full or partial text, with `%`, `_`, and the escape character treated literally.
+
+The response is the same Claim array as the Claim ID, IMEI, and Email searches: `claimId`, `imei`, `fullName`, `email`, `status`, `gifts`, and `createdAt`. Gift display names are deduplicated, and results are ordered by `Claims.created_at` descending and Claim ID descending. A database `NULL` creation date returns `createdAt: null`.
+
+Success response: `200 OK`; no matches return `[]`.
+
+Missing or empty `reference` response: `400 Bad Request`
+
+Database or configuration failure response: `503 Service Unavailable`
+
 ### Get Claim Details
 
 ```http
@@ -525,6 +541,62 @@ Success response: `200 OK`
 Unknown Claim response: `404 Not Found`
 
 Invalid Claim ID response: `400 Bad Request`
+
+Database or configuration failure response: `503 Service Unavailable`
+
+### Get Claim Fulfilment Rows
+
+```http
+GET /api/claims/fulfilment/{claimId}
+```
+
+For one or more Claim IDs in a single request, use:
+
+```http
+GET /api/claims/fulfilment?claimIds={claimId1}&claimIds={claimId2}
+```
+
+The `claimIds` parameter may be supplied once or repeated, and comma-separated IDs are also accepted. Duplicate IDs are removed case-insensitively, and at most 50 unique IDs may be requested. The original path route remains available for one exact `Claims.id`.
+
+The endpoint joins `Claims`, `Customers`, `Claim_Gifts`, `Gifts`, and `Deliver_Addresses`. The response is always one flat array with one row per related Claim Gift/SKU. Therefore, two requested Claims with two Gifts each may return four rows. Claim, customer, and delivery values repeat for each Gift. Unknown IDs and Claims without a related Gift are omitted from the batch response; if none match, it returns `200 OK` with `[]`.
+
+The latest delivery address is selected by preferring `is_current = 1` and then the highest `Deliver_Addresses.id`. Missing nullable address values and instructions are returned as empty strings.
+
+Response field rules:
+
+- Direct database values retain their database column names except that `Claims.id` is returned as `claimId`. The remaining direct names are `alias`, `street`, `suburb`, `city`, `postcode`, `contact`, `email`, and `instructions`. IMEI and Promotion ID are not returned.
+- `clientOrderNumber`, `consigneePoNumber`, and `shippingAddressLine3` are generated empty strings.
+- `lineId` is the generated constant `GWP`; `qty` is the generated constant integer `1`.
+- `fullName` is generated by combining `Customers.first_name` and `last_name`.
+- `alias` comes from `Gifts.alias` through `Claim_Gifts`.
+
+Success response: `200 OK`
+
+```json
+[
+  {
+    "claimId": "OPNZPROCLM-260903-QZ9RHCVK",
+    "clientOrderNumber": "",
+    "consigneePoNumber": "",
+    "lineId": "GWP",
+    "alias": "WATCH X2 BLACK",
+    "qty": 1,
+    "fullName": "Example Customer",
+    "street": "1 Example Street",
+    "suburb": "Newmarket",
+    "shippingAddressLine3": "",
+    "city": "Auckland",
+    "postcode": "1023",
+    "contact": "0211234567",
+    "email": "customer@example.com",
+    "instructions": "Leave at reception"
+  }
+]
+```
+
+The single-ID path returns `404 Not Found` for an unknown Claim or a Claim without a related Gift.
+
+Missing IDs, empty IDs, or more than 50 unique IDs response: `400 Bad Request`
 
 Database or configuration failure response: `503 Service Unavailable`
 

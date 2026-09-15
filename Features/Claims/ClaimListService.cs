@@ -48,8 +48,11 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
             INNER JOIN Customers ct ON ct.id = c.customer_id
             LEFT JOIN Claim_Gifts cg ON cg.claim_id = c.id
             LEFT JOIN Gifts g ON g.id = cg.gift_id
-            WHERE c.created_at >= @rangeStartUtc
-              AND c.created_at <= @rangeEndUtc
+            WHERE (
+                    c.created_at >= @rangeStartUtc
+                AND c.created_at <= @rangeEndUtc
+            )
+               OR c.status = 0
             ORDER BY c.created_at DESC, c.id DESC, g.name;
             """,
             connection);
@@ -74,11 +77,17 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
         CancellationToken cancellationToken) =>
         await SearchAsync(email, "email", "ct.email", cancellationToken);
 
+    public async Task<IReadOnlyList<ClaimListResult>> SearchByReferenceAsync(
+        string reference,
+        CancellationToken cancellationToken) =>
+        await SearchAsync(reference, "reference", "d.reference", cancellationToken, true);
+
     private async Task<IReadOnlyList<ClaimListResult>> SearchAsync(
         string value,
         string fieldName,
         string trustedColumn,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool searchDeliveries = false)
     {
         var searchValue = value.Trim();
         if (searchValue.Length == 0)
@@ -96,6 +105,10 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
         await using var connection = new MySqlConnection(
             NormalizeMySqlConnectionString(connectionString));
         await connection.OpenAsync(cancellationToken);
+
+        var searchPredicate = searchDeliveries
+            ? "EXISTS (SELECT 1 FROM Deliveries d WHERE d.claim_id = c.id AND d.reference LIKE CONCAT('%', @searchValue, '%') ESCAPE '=')"
+            : $"{trustedColumn} LIKE CONCAT('%', @searchValue, '%') ESCAPE '='";
 
         await using var command = new MySqlCommand(
             $"""
@@ -116,7 +129,7 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
             INNER JOIN Customers ct ON ct.id = c.customer_id
             LEFT JOIN Claim_Gifts cg ON cg.claim_id = c.id
             LEFT JOIN Gifts g ON g.id = cg.gift_id
-            WHERE {trustedColumn} LIKE CONCAT('%', @searchValue, '%') ESCAPE '='
+            WHERE {searchPredicate}
             ORDER BY c.created_at DESC, c.id DESC, g.name;
             """,
             connection);
