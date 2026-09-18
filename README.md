@@ -368,7 +368,7 @@ Database or R2 failure response: `503 Service Unavailable`
 GET /api/claims
 ```
 
-Returns the union of (1) Claims created from the start of the previous New Zealand calendar week through the current request time and (2) all Claims whose current `Claims.status` equals `0`, regardless of creation date. For example, a request made on Wednesday returns the complete previous Monday-to-Sunday period, the current Monday through Wednesday up to the request time, and any older unresolved status-0 Claims. A Claim matching both rules is returned only once. Results are ordered by `Claims.created_at` descending and then Claim ID descending.
+Returns the union of (1) Claims created from the start of the previous New Zealand calendar week through the current request time and (2) all Claims whose current `Claims.status` equals `0` or `1`, regardless of creation date. For example, a request made on Wednesday returns the complete previous Monday-to-Sunday period, the current Monday through Wednesday up to the request time, and any older status-0 or status-1 Claims. A Claim matching both rules is returned only once. Results are ordered by `Claims.created_at` descending and then Claim ID descending.
 
 Rules:
 
@@ -379,7 +379,7 @@ Rules:
 - `status` and `createdAt` come from `Claims.status` and `Claims.created_at`.
 - `gifts` contains distinct values from Gifts linked through `Claim_Gifts`. Each value is `Gifts.name + space + Gifts.color`; when `color` is empty or equals `Empty` (case-insensitive), only `Gifts.name` is returned. Multiple Gifts do not duplicate the Claim row.
 - `createdAt` is formatted as `yyyy-MM-dd HH:mm:ss`. Historical rows whose `Claims.created_at` is database `NULL` return `createdAt: null` instead of failing the request.
-- Week boundaries are calculated in the `Pacific/Auckland` time zone and converted to UTC for comparison with `Claims.created_at`. The date boundary does not apply to status-0 Claims.
+- Week boundaries are calculated in the `Pacific/Auckland` time zone and converted to UTC for comparison with `Claims.created_at`. The date boundary does not apply to status-0 or status-1 Claims.
 - The endpoint has no pagination input or 50-row limit; it returns every Claim in this date range.
 
 Success response: `200 OK`
@@ -503,6 +503,7 @@ Returns exactly one Claim matched by `Claims.id`.
 Response rules:
 
 - `claimId` comes from `Claims.id`.
+- `marketName` comes from `Devices.market_name`, matched by `Claims.imei = Devices.imei`. If no matching Device exists or its market name is `NULL`, the value is `null`; the Claim is still returned.
 - `email` and `contact` come from the related `Customers` row.
 - `street`, `suburb`, `city`, `postcode`, and `instructions` come from the latest current `Deliver_Addresses` row. Missing or database `NULL` values are returned as empty strings. `fullAddress` is also retained as the combined display value.
 - `giftAliases` contains every related `Gifts.alias` found through `Claim_Gifts`; no Gift returns an empty array.
@@ -520,6 +521,7 @@ Success response: `200 OK`
 {
   "claimId": "OPNZPROCLM-260903-4EUZB66Y",
   "promotionName": "Example Promotion",
+  "marketName": "Example Device",
   "email": "customer@example.com",
   "contact": "0211234567",
   "street": "1 Example Street",

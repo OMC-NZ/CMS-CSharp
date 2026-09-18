@@ -31,6 +31,7 @@ internal sealed partial class ClaimDetailsService(
             SELECT
                 c.promotion_id,
                 p.name AS promotion_name,
+                dev.market_name,
                 c.status,
                 ct.email,
                 ct.contact,
@@ -54,6 +55,7 @@ internal sealed partial class ClaimDetailsService(
             FROM Claims c
             INNER JOIN Customers ct ON ct.id = c.customer_id
             INNER JOIN Promotions p ON p.id = c.promotion_id
+            LEFT JOIN Devices dev ON dev.imei = c.imei
             LEFT JOIN Deliver_Addresses ha ON ha.id = (
                 SELECT ha2.id FROM Deliver_Addresses ha2
                 WHERE ha2.claim_id = c.id AND ha2.is_current = 1
@@ -76,6 +78,7 @@ internal sealed partial class ClaimDetailsService(
             row = new ClaimRow(
                 reader.GetInt32("promotion_id"),
                 reader.GetString("promotion_name"),
+                GetNullableString(reader, "market_name"),
                 reader.GetString("email"),
                 reader.GetString("contact"),
                 GetNullableString(reader, "street") ?? string.Empty,
@@ -99,7 +102,7 @@ internal sealed partial class ClaimDetailsService(
         var imeiCopy = await imeiCopyTask;
 
         return new ClaimDetailsResult(
-            normalizedClaimId, row.PromotionName, row.Email, row.Contact,
+            normalizedClaimId, row.PromotionName, row.MarketName, row.Email, row.Contact,
             row.Street, row.Suburb, row.City, row.Postcode, row.Instructions, row.FullAddress,
             giftAliases, receipt.PublicUrl, receipt.Sha256, imeiCopy.PublicUrl, imeiCopy.Sha256,
             row.Reference, row.TrackLink);
@@ -150,7 +153,7 @@ internal sealed partial class ClaimDetailsService(
     private static partial Regex ConnectionPortRegex();
 
     private sealed record ClaimRow(
-        int PromotionId, string PromotionName, string Email, string Contact,
+        int PromotionId, string PromotionName, string? MarketName, string Email, string Contact,
         string Street, string Suburb, string City, string Postcode, string Instructions,
         string FullAddress, string ReceiptValue, string ImeiCopyValue,
         string? Reference, string? TrackLink);
@@ -159,6 +162,7 @@ internal sealed partial class ClaimDetailsService(
 internal sealed record ClaimDetailsResult(
     string ClaimId,
     string PromotionName,
+    string? MarketName,
     string Email,
     string Contact,
     string Street,

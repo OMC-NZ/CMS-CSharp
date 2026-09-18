@@ -52,7 +52,7 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
                     c.created_at >= @rangeStartUtc
                 AND c.created_at <= @rangeEndUtc
             )
-               OR c.status = 0
+               OR c.status IN (0, 1)
             ORDER BY c.created_at DESC, c.id DESC, g.name;
             """,
             connection);
