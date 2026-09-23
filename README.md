@@ -772,6 +772,165 @@ Non-multipart request response: `415 Unsupported Media Type`
 
 Database or R2 failure response: `503 Service Unavailable`
 
+### Import Devices
+
+```http
+POST /api/devices/import
+Content-Type: application/json
+```
+
+Accepts Device data already extracted from a file by the frontend. The backend does not receive, identify, open, or parse the original Excel file. The `devices` array must contain between 1 and 100,000 items.
+
+Request body:
+
+```json
+{
+  "devices": [
+    {
+      "imei": "861234567890123",
+      "model": "CPH0000",
+      "marketName": "OPPO Example Device",
+      "color": "Black",
+      "category": 11
+    }
+  ]
+}
+```
+
+Input and database mappings:
+
+| JSON field | Devices column | Rule |
+| --- | --- | --- |
+| `marketName` | `market_name` | Required, maximum 45 characters. A leading `OPPO ` is removed case-insensitively and surrounding whitespace is trimmed. |
+| `imei` | `imei` | Required; must start with `86` and contain exactly 15 digits. |
+| `model` | `model` | Required; maximum 7 characters. |
+| `color` | `color` | Required; maximum 45 characters. |
+| `category` | `category` | Optional integer from -128 to 127. When supplied, its value is inserted. When omitted or `null`, the column is excluded from that row's INSERT and the database default is used. |
+
+The backend validates every item even when the frontend has already validated it. It deduplicates IMEIs in memory, checks existing IMEIs in database batches, separates rows with and without `category`, and inserts new Devices in batches of 500 inside one database transaction. Existing IMEIs and repeated IMEIs later in the same request are skipped and never overwrite existing Device data. Invalid items are skipped while valid items continue to import. At most the first 100 item errors are returned. Imported rows receive `redemption_status = 0`; other Device columns not listed above use their database defaults.
+
+Success response: `200 OK`
+
+```json
+{
+  "itemsReceived": 10000,
+  "validUniqueItems": 9980,
+  "insertedItems": 9500,
+  "existingItems": 480,
+  "duplicateItemsInRequest": 10,
+  "invalidItems": 10,
+  "errors": [
+    {
+      "index": 25,
+      "imei": "12345",
+      "message": "IMEI must start with 86 and contain exactly 15 digits."
+    }
+  ],
+  "errorsTruncated": false
+}
+```
+
+Missing or empty `devices`, too many items, or an otherwise invalid request response: `400 Bad Request`
+
+Database or configuration failure response: `503 Service Unavailable`
+
+### Search Device Records by IMEI
+
+```http
+GET /api/devices/search/imei?imei={imei1}&imei={imei2}
+```
+
+Performs exact matches against `Devices.imei`. At least one `imei` is required and every value must contain exactly 15 digits. Supply multiple values by repeating the query parameter. Duplicate search values are ignored.
+
+### Search Device Records by Model
+
+```http
+GET /api/devices/search/model?model={model1}&model={model2}
+```
+
+Performs case-insensitive exact matches against `Devices.model`. Supply multiple values by repeating `model`. Each value may be supplied as `CPH1234`, `cph1234`, or `1234`. The backend trims it, converts it to uppercase, and adds the `CPH` prefix when only digits are supplied. Other formats return `400 Bad Request`, and duplicate normalized models are ignored.
+
+### Search Device Records by Market Name
+
+```http
+GET /api/devices/search/market-name?market_name={name1}&market_name={name2}
+```
+
+Performs a case-insensitive contains search against `Devices.market_name`. A Device matches when its market name contains any supplied value. Supply multiple values by repeating `market_name`. Values are trimmed and deduplicated case-insensitively. `%`, `_`, and the escape character are treated as literal search text.
+
+Each endpoint accepts at most 100 unique search values. The recommended frontend input is a textarea with one value per line. The frontend should split and trim the lines, then append each value using the same query parameter name. For example, two IMEIs become `?imei=861111111111111&imei=862222222222222`. For compatibility, the backend also splits CR/LF characters contained inside a single decoded query value, but repeated parameters are the preferred wire format.
+
+All three Device record search endpoints use the same response shape. `total` is the complete number of Device rows matching any supplied value, while `items` contains at most the latest 30 rows ordered by `Devices.created_at` descending and then IMEI. A Device matching more than one search value is counted and returned once. Each item includes `Devices.category`. `Devices.channel_code` is used internally to left join `Channels.code`; `channelName` is returned and channel code is not exposed. A Device with no matching Channel is still returned with `channelName: null`. `createdAt` and `updatedAt` use `yyyy-MM-dd HH:mm:ss`; nullable database values return `null`.
+
+Success response: `200 OK`
+
+```json
+{
+  "total": 42,
+  "items": [
+    {
+      "imei": "861234567890123",
+      "model": "CPH1234",
+      "category": 11,
+      "marketName": "Example Device",
+      "color": "Black",
+      "channelName": "Example Retailer",
+      "redemptionStatus": 0,
+      "createdAt": "2026-09-22 09:30:00",
+      "updatedAt": "2026-09-22 09:40:00"
+    }
+  ]
+}
+```
+
+Missing or invalid query parameter response: `400 Bad Request`
+
+Database or configuration failure response: `503 Service Unavailable`
+
+### Update Device by IMEI
+
+```http
+PATCH /api/devices/{imei}
+Content-Type: application/json
+```
+
+Updates exactly one Device selected by its 15-digit `Devices.imei`. The request may include `category`, `channelCode`, or both. Only fields with non-null values are updated; omitted fields and fields explicitly set to `null` remain unchanged. At least one field must be supplied with a non-null value. This endpoint cannot change `Devices.redemption_status`.
+
+Request body example:
+
+```json
+{
+  "category": 11,
+  "channelCode": "HVNM"
+}
+```
+
+Rules:
+
+- `category` must be an integer from `-128` through `127`.
+- `channelCode` is trimmed, converted to uppercase, limited to four characters, and must exactly match an existing `Channels.code`.
+- `Devices.updated_at` is set to the current database timestamp after an update.
+- The validation, Channel lookup, and Device update run in one database transaction.
+
+Success response: `200 OK`
+
+```json
+{
+  "success": true,
+  "imei": "861234567890123",
+  "updatedFields": [
+    "category",
+    "channelCode"
+  ]
+}
+```
+
+Missing update values, invalid values, or unknown Channel code response: `400 Bad Request`
+
+Unknown IMEI response: `404 Not Found`
+
+Database or configuration failure response: `503 Service Unavailable`
+
 ### Search Device Models
 
 ```http

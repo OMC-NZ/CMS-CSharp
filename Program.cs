@@ -5,6 +5,7 @@ using CMS_CSharp.Contracts.Devices;
 using CMS_CSharp.Contracts.Gifts;
 using CMS_CSharp.Data.Repositories;
 using CMS_CSharp.Features.Claims;
+using CMS_CSharp.Features.Devices;
 using CMS_CSharp.Features.Promotions;
 using CMS_CSharp.Features.Promotions.DuplicateDetection;
 using CMS_CSharp.Services.Email;
@@ -39,6 +40,9 @@ builder.Services.AddScoped<ClaimDetailsService>();
 builder.Services.AddScoped<ClaimFulfilmentService>();
 builder.Services.AddScoped<ClaimUpdateService>();
 builder.Services.AddScoped<ClaimDeletionService>();
+builder.Services.AddScoped<DeviceImportService>();
+builder.Services.AddScoped<DeviceLookupService>();
+builder.Services.AddScoped<DeviceUpdateService>();
 
 if (builder.Environment.IsDevelopment())
 {
@@ -258,6 +262,98 @@ app.MapGet("/api/devices/search", async (
     }
 })
 .WithName("SearchDevicesByMarketName");
+
+app.MapPost("/api/devices/import", async (
+    DeviceImportRequest request,
+    DeviceImportService deviceImportService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        return Results.Ok(await deviceImportService.ImportAsync(request, cancellationToken));
+    }
+    catch (DeviceImportValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogError(exception, "Device Excel import failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Device import failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("ImportDevices");
+
+app.MapGet("/api/devices/search/imei", async (
+    string[]? imei,
+    DeviceLookupService deviceLookupService,
+    CancellationToken cancellationToken) =>
+    await ExecuteDeviceLookupAsync(
+        app,
+        () => deviceLookupService.FindByImeiAsync(imei, cancellationToken),
+        "Device IMEI search failed."))
+.WithName("SearchDevicesByImei");
+
+app.MapGet("/api/devices/search/model", async (
+    string[]? model,
+    DeviceLookupService deviceLookupService,
+    CancellationToken cancellationToken) =>
+    await ExecuteDeviceLookupAsync(
+        app,
+        () => deviceLookupService.FindByModelAsync(model, cancellationToken),
+        "Device model search failed."))
+.WithName("SearchDevicesByExactModel");
+
+app.MapGet("/api/devices/search/market-name", async (
+    string[]? market_name,
+    DeviceLookupService deviceLookupService,
+    CancellationToken cancellationToken) =>
+    await ExecuteDeviceLookupAsync(
+        app,
+        () => deviceLookupService.FindByMarketNameAsync(market_name, cancellationToken),
+        "Device market name search failed."))
+.WithName("SearchDevicesByMarketNameText");
+
+app.MapPatch("/api/devices/{imei}", async (
+    string imei,
+    DeviceUpdateRequest request,
+    DeviceUpdateService deviceUpdateService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var result = await deviceUpdateService.UpdateAsync(
+            imei, request, cancellationToken);
+        return result is null
+            ? Results.NotFound(new
+            {
+                error = $"Device with IMEI '{imei.Trim()}' was not found."
+            })
+            : Results.Ok(result);
+    }
+    catch (DeviceUpdateValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogError(exception, "Device update failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Device update failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("UpdateDeviceByImei");
 
 app.MapGet("/api/channels/search", async (
     string name,
@@ -1019,6 +1115,32 @@ app.MapDelete("/api/claims/{claimId}", async (
 .WithName("DeleteClaimById");
 
 app.Run();
+
+static async Task<IResult> ExecuteDeviceLookupAsync(
+    WebApplication app,
+    Func<Task<DeviceLookupResult>> lookup,
+    string logMessage)
+{
+    try
+    {
+        return Results.Ok(await lookup());
+    }
+    catch (DeviceLookupValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning(exception, "{Message}", logMessage);
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : logMessage
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+}
 
 static IReadOnlyList<T> DeserializeRequiredList<T>(
     IFormCollection form,
