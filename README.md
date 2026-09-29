@@ -373,6 +373,7 @@ Returns the union of (1) Claims created from the start of the previous New Zeala
 Rules:
 
 - `claimId` comes from `Claims.id`.
+- `promotionId` comes from `Claims.promotion_id`.
 - `imei` comes from `Claims.imei`.
 - `fullName` combines `Customers.first_name` and `Customers.last_name` with one space.
 - `email` comes from `Customers.email`.
@@ -388,6 +389,7 @@ Success response: `200 OK`
 [
   {
     "claimId": "OPNZPROCLM-260903-4EUZB66Y",
+    "promotionId": 249,
     "imei": "490154203237518",
     "fullName": "Chris Example",
     "email": "customer@example.com",
@@ -426,6 +428,7 @@ Success response: `200 OK`
 [
   {
     "claimId": "OPNZPROCLM-260831-KICYCCH1",
+    "promotionId": 249,
     "imei": "868874080676538",
     "fullName": "Chris Example",
     "email": "customer@example.com",
@@ -484,7 +487,7 @@ GET /api/claims/search/reference?reference={reference}
 
 Performs a contains search against `Deliveries.reference`, matched through `Deliveries.claim_id = Claims.id`, without a date or Claim-status restriction. Any matching Delivery reference qualifies its Claim; multiple matching Delivery rows do not duplicate the Claim. The required `reference` parameter accepts full or partial text, with `%`, `_`, and the escape character treated literally.
 
-The response is the same Claim array as the Claim ID, IMEI, and Email searches: `claimId`, `imei`, `fullName`, `email`, `status`, `gifts`, and `createdAt`. Gift display names are deduplicated, and results are ordered by `Claims.created_at` descending and Claim ID descending. A database `NULL` creation date returns `createdAt: null`.
+The response is the same Claim array as the Claim ID, IMEI, and Email searches: `claimId`, `promotionId`, `imei`, `fullName`, `email`, `status`, `gifts`, and `createdAt`. Gift display names are deduplicated, and results are ordered by `Claims.created_at` descending and Claim ID descending. A database `NULL` creation date returns `createdAt: null`.
 
 Success response: `200 OK`; no matches return `[]`.
 

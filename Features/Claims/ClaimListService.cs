@@ -33,6 +33,7 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
             """
             SELECT
                 c.id AS claim_id,
+                c.promotion_id,
                 c.imei,
                 CONCAT_WS(' ', NULLIF(TRIM(ct.first_name), ''), NULLIF(TRIM(ct.last_name), '')) AS full_name,
                 ct.email,
@@ -114,6 +115,7 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
             $"""
             SELECT
                 c.id AS claim_id,
+                c.promotion_id,
                 c.imei,
                 CONCAT_WS(' ', NULLIF(TRIM(ct.first_name), ''), NULLIF(TRIM(ct.last_name), '')) AS full_name,
                 ct.email,
@@ -151,6 +153,7 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
             {
                 claim = new ClaimListBuilder(
                     claimId,
+                    reader.GetInt32("promotion_id"),
                     reader.GetString("imei"),
                     reader.GetString("full_name"),
                     reader.GetString("email"),
@@ -170,6 +173,7 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
         return claims.Values
             .Select(claim => new ClaimListResult(
                 claim.ClaimId,
+                claim.PromotionId,
                 claim.Imei,
                 claim.FullName,
                 claim.Email,
@@ -207,6 +211,7 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
 
     private sealed record ClaimListBuilder(
         string ClaimId,
+        int PromotionId,
         string Imei,
         string FullName,
         string Email,
@@ -219,6 +224,7 @@ internal sealed partial class ClaimListService(IConfiguration configuration)
 
 internal sealed record ClaimListResult(
     string ClaimId,
+    int PromotionId,
     string Imei,
     string FullName,
     string Email,
