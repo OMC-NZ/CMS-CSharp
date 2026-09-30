@@ -4,12 +4,14 @@ using CMS_CSharp.Contracts.Channels;
 using CMS_CSharp.Contracts.Devices;
 using CMS_CSharp.Contracts.Gifts;
 using CMS_CSharp.Data.Repositories;
+using CMS_CSharp.Features.Auth;
 using CMS_CSharp.Features.Claims;
 using CMS_CSharp.Features.Devices;
 using CMS_CSharp.Features.Promotions;
 using CMS_CSharp.Features.Promotions.DuplicateDetection;
 using CMS_CSharp.Services.Email;
 using CMS_CSharp.Services.Storage;
+using CMS_CSharp.Validation;
 using MySqlConnector;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -43,6 +45,9 @@ builder.Services.AddScoped<ClaimDeletionService>();
 builder.Services.AddScoped<DeviceImportService>();
 builder.Services.AddScoped<DeviceLookupService>();
 builder.Services.AddScoped<DeviceUpdateService>();
+builder.Services.AddScoped<AccountCreationService>();
+builder.Services.AddScoped<RoleLookupService>();
+builder.Services.AddScoped<LoginService>();
 
 if (builder.Environment.IsDevelopment())
 {
@@ -107,6 +112,110 @@ app.MapGet("/", (IHostEnvironment environment) => Results.Ok(new
 .WithName("GetApiStatus");
 
 app.MapHealthChecks("/health");
+
+app.MapPost("/api/auth/login", async (
+    LoginCommand command,
+    HttpContext httpContext,
+    LoginService loginService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        return Results.Ok(await loginService.LoginAsync(
+            command,
+            httpContext.Connection.RemoteIpAddress?.ToString(),
+            httpContext.Request.Headers.UserAgent.ToString(),
+            cancellationToken));
+    }
+    catch (Exception exception) when (
+        exception is LoginValidationException or InputValidationException)
+    {
+        return Results.BadRequest(new { success = false, message = exception.Message });
+    }
+    catch (LoginUnauthorizedException exception)
+    {
+        return Results.Json(
+            new { success = false, message = exception.Message },
+            statusCode: StatusCodes.Status401Unauthorized);
+    }
+    catch (LoginForbiddenException exception)
+    {
+        return Results.Json(
+            new { success = false, message = exception.Message },
+            statusCode: StatusCodes.Status403Forbidden);
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogError(exception, "Login failed.");
+        return Results.Json(new
+        {
+            success = false,
+            message = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Login service is unavailable."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("Login");
+
+app.MapGet("/api/roles", async (
+    RoleLookupService roleLookupService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        return Results.Ok(await roleLookupService.GetActiveAsync(cancellationToken));
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogError(exception, "Role lookup failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Role lookup failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("GetActiveRoles");
+
+app.MapPost("/api/accounts", async (
+    CreateAccountCommand command,
+    AccountCreationService accountCreationService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var result = await accountCreationService.CreateAsync(command, cancellationToken);
+        return Results.Created($"/api/accounts/{result.AccountId}", result);
+    }
+    catch (AccountValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (InputValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (AccountConflictException exception)
+    {
+        return Results.Conflict(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogError(exception, "Account creation failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Account creation failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("CreateAccount");
 
 app.MapGet("/database/status", async (IConfiguration configuration, CancellationToken cancellationToken) =>
 {

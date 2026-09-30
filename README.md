@@ -55,6 +55,154 @@ Success response: `200 OK`
 Healthy
 ```
 
+### Login
+
+```http
+POST /api/auth/login
+Content-Type: application/json
+```
+
+Validates an account by normalized email and password against the database configured by `ConnectionStrings:AuthConnection`. Both the Account and associated User must have `status = 1`. Successful login creates a hashed refresh-token session, updates `accounts.last_login_at`, and returns the active roles and permissions used by the frontend.
+
+Request body:
+
+```json
+{
+  "email": "admin@example.com",
+  "password": "Admin12345"
+}
+```
+
+Success response: `200 OK`
+
+```json
+{
+  "success": true,
+  "accessToken": "eyJ...",
+  "refreshToken": "generated-refresh-token",
+  "tokenType": "Bearer",
+  "expiresAt": "2026-09-30T04:15:00Z",
+  "user": {
+    "id": 1,
+    "accountId": 1,
+    "email": "admin@example.com",
+    "firstName": "Chris",
+    "lastName": "He",
+    "displayName": "Chris He"
+  },
+  "roles": ["SUPER_ADMIN"],
+  "permissions": ["accounts.create", "claims.view"]
+}
+```
+
+Filtering and validation rules:
+
+- Email is required, trimmed, lowercased, and validated.
+- Password is required and verified against `accounts.pwd_hash` with ASP.NET Core Identity's password hasher.
+- Disabled Accounts and Users cannot log in.
+- Only active roles and active permissions are returned.
+- The refresh token itself is returned only once; only its SHA-256 hash is stored in `sessions`.
+
+Relevant status codes:
+
+- `200 OK`: Login succeeded.
+- `400 Bad Request`: Email or password is missing, or the email format is invalid.
+- `401 Unauthorized`: Email or password is incorrect.
+- `403 Forbidden`: The Account or User is disabled.
+- `503 Service Unavailable`: Authentication configuration or the Auth database is unavailable.
+
+Authentication configuration:
+
+| Key | Required | Description |
+| --- | --- | --- |
+| `JWT_SECRET` | Yes | Private signing secret of at least 32 bytes. Never commit its real value. |
+| `JWT_ISSUER` | Yes | JWT issuer. |
+| `JWT_AUDIENCE` | Yes | JWT audience. |
+| `JWT_ACCESS_TOKEN_MINUTES` | No | Access-token lifetime; defaults to 15 minutes. |
+| `JWT_REFRESH_TOKEN_DAYS` | No | Refresh-token session lifetime; defaults to 7 days. |
+
+### Create Account
+
+```http
+POST /api/accounts
+Content-Type: application/json
+```
+
+Creates one active login account, its associated CMS user profile, and its role assignments in the database configured by `ConnectionStrings:AuthConnection`. All writes use one transaction. The password is stored only as an ASP.NET Core Identity password hash.
+
+Request body:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `email` | Yes | Valid email address. It is trimmed, lowercased, and must be unique. |
+| `password` | Yes | 8-128 characters with at least one uppercase letter, one lowercase letter, and one digit. |
+| `firstName` | Yes | CMS user's first name. It is trimmed and converted to title case. |
+| `lastName` | Yes | CMS user's last name. It is trimmed and converted to title case. |
+| `displayName` | No | Display name. When omitted, `firstName + lastName` is used. |
+| `roleCodes` | Yes | Array containing at least one active role code. Codes are trimmed, uppercased, resolved to role IDs, and then stored in `account_roles`. |
+
+Example request:
+
+```json
+{
+  "email": "staff@example.com",
+  "password": "Example123",
+  "firstName": "Chris",
+  "lastName": "He",
+  "displayName": "Chris He",
+  "roleCodes": ["SUPER_ADMIN"]
+}
+```
+
+Success response: `201 Created`
+
+```json
+{
+  "success": true,
+  "accountId": 10,
+  "userId": 10,
+  "roleCodes": ["SUPER_ADMIN"]
+}
+```
+
+Relevant status codes:
+
+- `201 Created`: Account, user profile, and role assignments were created.
+- `400 Bad Request`: Input validation failed or an active role code was not found.
+- `409 Conflict`: The normalized email address already exists.
+- `503 Service Unavailable`: `AuthConnection` is unavailable or a database operation failed.
+
+This endpoint is a bootstrap endpoint until authentication and permission middleware are added. It must be restricted to authorized account administrators before the API is exposed publicly.
+
+### Get Active Roles
+
+```http
+GET /api/roles
+```
+
+Returns all roles with `status = 1`, ordered by `name` and then `id`. The endpoint has no inputs. A frontend account form should display the role name and send the selected `code` in the `roleCodes` array to `POST /api/accounts`. The backend resolves each code to its database role ID.
+
+Success response: `200 OK`
+
+```json
+[
+  {
+    "id": 1,
+    "code": "SUPER_ADMIN",
+    "name": "Super Administrator",
+    "description": "Full CMS access"
+  }
+]
+```
+
+When no active roles exist, the endpoint returns `200 OK` with an empty array:
+
+```json
+[]
+```
+
+Database or configuration failure response: `503 Service Unavailable`
+
 ### Database Connection Status
 
 ```http
