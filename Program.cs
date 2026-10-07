@@ -1,3 +1,6 @@
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Text.Json;
 using CMS_CSharp.Contracts.Channels;
@@ -12,6 +15,9 @@ using CMS_CSharp.Features.Promotions.DuplicateDetection;
 using CMS_CSharp.Services.Email;
 using CMS_CSharp.Services.Storage;
 using CMS_CSharp.Validation;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.IdentityModel.Tokens;
 using MySqlConnector;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -23,6 +29,132 @@ builder.Logging.AddConsole();
 // Add services to the container.
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddHealthChecks();
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        var jwtSecret = builder.Configuration["JWT_SECRET"];
+        var jwtIssuer = builder.Configuration["JWT_ISSUER"];
+        var jwtAudience = builder.Configuration["JWT_AUDIENCE"];
+        if (string.IsNullOrWhiteSpace(jwtSecret) || Encoding.UTF8.GetByteCount(jwtSecret) < 32)
+        {
+            throw new InvalidOperationException(
+                "JWT_SECRET must be configured with at least 32 bytes.");
+        }
+        if (string.IsNullOrWhiteSpace(jwtIssuer) || string.IsNullOrWhiteSpace(jwtAudience))
+        {
+            throw new InvalidOperationException(
+                "JWT_ISSUER and JWT_AUDIENCE must be configured.");
+        }
+
+        options.MapInboundClaims = false;
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),
+            ValidateIssuer = true,
+            ValidIssuer = jwtIssuer,
+            ValidateAudience = true,
+            ValidAudience = jwtAudience,
+            ValidateLifetime = true,
+            RequireExpirationTime = true,
+            RequireSignedTokens = true,
+            ClockSkew = TimeSpan.FromSeconds(30),
+            ValidAlgorithms = [SecurityAlgorithms.HmacSha256]
+        };
+        options.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = async context =>
+            {
+                var principal = context.Principal;
+                var sessionId = principal?.FindFirstValue("sid");
+                if (principal is null ||
+                    !int.TryParse(principal.FindFirstValue(JwtRegisteredClaimNames.Sub), out var accountId) ||
+                    !int.TryParse(principal.FindFirstValue("user_id"), out var userId) ||
+                    !int.TryParse(principal.FindFirstValue("security_version"), out var securityVersion) ||
+                    string.IsNullOrWhiteSpace(sessionId))
+                {
+                    context.Fail("Required authentication claims are missing.");
+                    return;
+                }
+
+                var validator = context.HttpContext.RequestServices
+                    .GetRequiredService<SessionValidationService>();
+                var access = await validator.ValidateAsync(
+                    accountId,
+                    userId,
+                    sessionId,
+                    securityVersion,
+                    context.HttpContext.RequestAborted);
+                if (access is null)
+                {
+                    context.Fail("The login session is no longer valid.");
+                    return;
+                }
+
+                if (principal.Identity is ClaimsIdentity identity)
+                {
+                    foreach (var claim in identity.FindAll("roles").ToArray())
+                    {
+                        identity.RemoveClaim(claim);
+                    }
+                    foreach (var claim in identity.FindAll("permissions").ToArray())
+                    {
+                        identity.RemoveClaim(claim);
+                    }
+                    foreach (var role in access.Roles)
+                    {
+                        identity.AddClaim(new Claim("roles", role));
+                    }
+                    foreach (var permission in access.Permissions)
+                    {
+                        identity.AddClaim(new Claim("permissions", permission));
+                    }
+                }
+            },
+            OnChallenge = async context =>
+            {
+                context.HandleResponse();
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsJsonAsync(new
+                {
+                    success = false,
+                    message = "Authentication is required."
+                });
+            },
+            OnForbidden = async context =>
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsJsonAsync(new
+                {
+                    success = false,
+                    message = "You do not have permission to perform this action."
+                });
+            }
+        };
+    });
+builder.Services.AddAuthorization(options =>
+{
+    options.FallbackPolicy = new AuthorizationPolicyBuilder()
+        .RequireAuthenticatedUser()
+        .Build();
+
+    foreach (var permissionCode in PermissionCodes.All)
+    {
+        options.AddPolicy(permissionCode, policy =>
+        {
+            policy.RequireAuthenticatedUser();
+            policy.RequireAssertion(context => context.User
+                .FindAll("permissions")
+                .Any(claim => string.Equals(
+                    claim.Value,
+                    permissionCode,
+                    StringComparison.OrdinalIgnoreCase)));
+        });
+    }
+});
 builder.Services.AddSingleton<IR2StorageService, R2StorageService>();
 builder.Services.AddScoped<IClaimConfirmationEmailService, ClaimConfirmationEmailService>();
 builder.Services.AddSingleton<ClaimConfirmationEmailQueue>();
@@ -48,6 +180,8 @@ builder.Services.AddScoped<DeviceUpdateService>();
 builder.Services.AddScoped<AccountCreationService>();
 builder.Services.AddScoped<RoleLookupService>();
 builder.Services.AddScoped<LoginService>();
+builder.Services.AddScoped<SessionValidationService>();
+builder.Services.AddScoped<AccountListService>();
 
 if (builder.Environment.IsDevelopment())
 {
@@ -102,6 +236,9 @@ else
     app.UseHttpsRedirection();
 }
 
+app.UseAuthentication();
+app.UseAuthorization();
+
 app.MapGet("/", (IHostEnvironment environment) => Results.Ok(new
 {
     name = "OMC CMS API",
@@ -109,9 +246,11 @@ app.MapGet("/", (IHostEnvironment environment) => Results.Ok(new
     environment = environment.EnvironmentName,
     utcTime = DateTimeOffset.UtcNow
 }))
-.WithName("GetApiStatus");
+.WithName("GetApiStatus")
+.AllowAnonymous();
 
-app.MapHealthChecks("/health");
+app.MapHealthChecks("/health")
+    .AllowAnonymous();
 
 app.MapPost("/api/auth/login", async (
     LoginCommand command,
@@ -157,7 +296,8 @@ app.MapPost("/api/auth/login", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("Login");
+.WithName("Login")
+.AllowAnonymous();
 
 app.MapGet("/api/roles", async (
     RoleLookupService roleLookupService,
@@ -179,7 +319,8 @@ app.MapGet("/api/roles", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("GetActiveRoles");
+.WithName("GetActiveRoles")
+.RequireAuthorization(PermissionCodes.RolesView);
 
 app.MapPost("/api/accounts", async (
     CreateAccountCommand command,
@@ -215,7 +356,95 @@ app.MapPost("/api/accounts", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("CreateAccount");
+.WithName("CreateAccount")
+.RequireAuthorization(PermissionCodes.AccountsCreate);
+
+app.MapGet("/api/accounts", async (
+    AccountListService accountListService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        return Results.Ok(await accountListService.GetAllAsync(cancellationToken));
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogError(exception, "Account list lookup failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Account list lookup failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("GetAccounts")
+.RequireAuthorization(PermissionCodes.AccountsView);
+
+app.MapGet("/api/accounts/search", async (
+    string[]? email,
+    AccountListService accountListService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        return Results.Ok(await accountListService.FindByEmailsAsync(
+            email,
+            cancellationToken));
+    }
+    catch (Exception exception) when (
+        exception is AccountValidationException or InputValidationException)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogError(exception, "Account email lookup failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Account email lookup failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("SearchAccountsByEmail")
+.RequireAuthorization(PermissionCodes.AccountsView);
+
+app.MapGet("/api/accounts/{accountId:int}", async (
+    int accountId,
+    AccountListService accountListService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var account = await accountListService.FindByAccountIdAsync(
+            accountId,
+            cancellationToken);
+        return account is null
+            ? Results.NotFound(new { error = $"Account '{accountId}' was not found." })
+            : Results.Ok(account);
+    }
+    catch (AccountValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogError(exception, "Account ID lookup failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Account ID lookup failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("GetAccountById")
+.RequireAuthorization(PermissionCodes.AccountsView);
 
 app.MapGet("/database/status", async (IConfiguration configuration, CancellationToken cancellationToken) =>
 {
@@ -271,7 +500,8 @@ app.MapGet("/database/status", async (IConfiguration configuration, Cancellation
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("GetDatabaseConfigurationStatus");
+.WithName("GetDatabaseConfigurationStatus")
+.RequireAuthorization(PermissionCodes.AccountsView);
 
 app.MapGet("/api/devices/search", async (
     string market_name,
@@ -370,7 +600,8 @@ app.MapGet("/api/devices/search", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("SearchDevicesByMarketName");
+.WithName("SearchDevicesByMarketName")
+.RequireAuthorization(PermissionCodes.DevicesView);
 
 app.MapPost("/api/devices/import", async (
     DeviceImportRequest request,
@@ -397,7 +628,8 @@ app.MapPost("/api/devices/import", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("ImportDevices");
+.WithName("ImportDevices")
+.RequireAuthorization(PermissionCodes.DevicesCreate);
 
 app.MapGet("/api/devices/search/imei", async (
     string[]? imei,
@@ -407,7 +639,8 @@ app.MapGet("/api/devices/search/imei", async (
         app,
         () => deviceLookupService.FindByImeiAsync(imei, cancellationToken),
         "Device IMEI search failed."))
-.WithName("SearchDevicesByImei");
+.WithName("SearchDevicesByImei")
+.RequireAuthorization(PermissionCodes.DevicesView);
 
 app.MapGet("/api/devices/search/model", async (
     string[]? model,
@@ -417,7 +650,8 @@ app.MapGet("/api/devices/search/model", async (
         app,
         () => deviceLookupService.FindByModelAsync(model, cancellationToken),
         "Device model search failed."))
-.WithName("SearchDevicesByExactModel");
+.WithName("SearchDevicesByExactModel")
+.RequireAuthorization(PermissionCodes.DevicesView);
 
 app.MapGet("/api/devices/search/market-name", async (
     string[]? market_name,
@@ -427,7 +661,8 @@ app.MapGet("/api/devices/search/market-name", async (
         app,
         () => deviceLookupService.FindByMarketNameAsync(market_name, cancellationToken),
         "Device market name search failed."))
-.WithName("SearchDevicesByMarketNameText");
+.WithName("SearchDevicesByMarketNameText")
+.RequireAuthorization(PermissionCodes.DevicesView);
 
 app.MapPatch("/api/devices/{imei}", async (
     string imei,
@@ -462,7 +697,8 @@ app.MapPatch("/api/devices/{imei}", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("UpdateDeviceByImei");
+.WithName("UpdateDeviceByImei")
+.RequireAuthorization(PermissionCodes.DevicesEdit);
 
 app.MapGet("/api/channels/search", async (
     string name,
@@ -535,7 +771,8 @@ app.MapGet("/api/channels/search", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("SearchChannelsByName");
+.WithName("SearchChannelsByName")
+.RequireAuthorization(PermissionCodes.PromotionsView);
 
 app.MapGet("/api/channels", async (
     IConfiguration configuration,
@@ -593,7 +830,8 @@ app.MapGet("/api/channels", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("GetChannels");
+.WithName("GetChannels")
+.RequireAuthorization(PermissionCodes.PromotionsView);
 
 app.MapGet("/api/gifts/search", async (
     string name,
@@ -668,7 +906,8 @@ app.MapGet("/api/gifts/search", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("SearchGiftsByName");
+.WithName("SearchGiftsByName")
+.RequireAuthorization(PermissionCodes.PromotionsView);
 
 app.MapGet("/api/promotions", async (
     PromotionListService promotionListService,
@@ -689,7 +928,8 @@ app.MapGet("/api/promotions", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("GetPromotions");
+.WithName("GetPromotions")
+.RequireAuthorization(PermissionCodes.PromotionsView);
 
 app.MapGet("/api/promotions/{promotionId:int}", async (
     int promotionId,
@@ -718,7 +958,8 @@ app.MapGet("/api/promotions/{promotionId:int}", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("GetPromotionById");
+.WithName("GetPromotionById")
+.RequireAuthorization(PermissionCodes.PromotionsView);
 
 app.MapPost("/api/promotions", async (
     HttpRequest httpRequest,
@@ -792,7 +1033,8 @@ app.MapPost("/api/promotions", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("CreatePromotion");
+.WithName("CreatePromotion")
+.RequireAuthorization(PermissionCodes.PromotionsCreate);
 
 app.MapGet("/api/promotions/eligible", async (
     string? imei,
@@ -826,7 +1068,8 @@ app.MapGet("/api/promotions/eligible", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("GetEligiblePromotionsByImei");
+.WithName("GetEligiblePromotionsByImei")
+.AllowAnonymous();
 
 app.MapPost("/api/claims", async (
     HttpRequest httpRequest,
@@ -893,7 +1136,8 @@ app.MapPost("/api/claims", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("CreateClaim");
+.WithName("CreateClaim")
+.AllowAnonymous();
 
 app.MapGet("/api/claims", async (
     ClaimListService claimListService,
@@ -915,7 +1159,8 @@ app.MapGet("/api/claims", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("GetClaims");
+.WithName("GetClaims")
+.RequireAuthorization(PermissionCodes.ClaimsView);
 
 app.MapGet("/api/claims/search", async (
     string? claim_id,
@@ -949,7 +1194,8 @@ app.MapGet("/api/claims/search", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("SearchClaimsById");
+.WithName("SearchClaimsById")
+.RequireAuthorization(PermissionCodes.ClaimsView);
 
 app.MapGet("/api/claims/search/imei", async (
     string? imei,
@@ -981,7 +1227,8 @@ app.MapGet("/api/claims/search/imei", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("SearchClaimsByImei");
+.WithName("SearchClaimsByImei")
+.RequireAuthorization(PermissionCodes.ClaimsView);
 
 app.MapGet("/api/claims/search/email", async (
     string? email,
@@ -1013,7 +1260,8 @@ app.MapGet("/api/claims/search/email", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("SearchClaimsByEmail");
+.WithName("SearchClaimsByEmail")
+.RequireAuthorization(PermissionCodes.ClaimsView);
 
 app.MapGet("/api/claims/search/reference", async (
     string? reference,
@@ -1045,7 +1293,8 @@ app.MapGet("/api/claims/search/reference", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("SearchClaimsByReference");
+.WithName("SearchClaimsByReference")
+.RequireAuthorization(PermissionCodes.ClaimsView);
 
 app.MapGet("/api/claims/view/{claimId}", async (
     string claimId,
@@ -1075,7 +1324,8 @@ app.MapGet("/api/claims/view/{claimId}", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("ViewClaimById");
+.WithName("ViewClaimById")
+.RequireAuthorization(PermissionCodes.ClaimsView);
 
 app.MapGet("/api/claims/fulfilment", async (
     string[]? claimIds,
@@ -1107,7 +1357,8 @@ app.MapGet("/api/claims/fulfilment", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("GetClaimFulfilmentByIds");
+.WithName("GetClaimFulfilmentByIds")
+.RequireAuthorization(PermissionCodes.ClaimsExport);
 
 app.MapGet("/api/claims/fulfilment/{claimId}", async (
     string claimId,
@@ -1137,7 +1388,8 @@ app.MapGet("/api/claims/fulfilment/{claimId}", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("GetClaimFulfilmentById");
+.WithName("GetClaimFulfilmentById")
+.RequireAuthorization(PermissionCodes.ClaimsExport);
 
 app.MapPatch("/api/claims/{claimId}", async (
     string claimId,
@@ -1191,7 +1443,8 @@ app.MapPatch("/api/claims/{claimId}", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("UpdateClaimById");
+.WithName("UpdateClaimById")
+.RequireAuthorization(PermissionCodes.ClaimsEdit);
 
 app.MapDelete("/api/claims/{claimId}", async (
     string claimId,
@@ -1221,7 +1474,8 @@ app.MapDelete("/api/claims/{claimId}", async (
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("DeleteClaimById");
+.WithName("DeleteClaimById")
+.RequireAuthorization(PermissionCodes.ClaimsDelete);
 
 app.Run();
 

@@ -144,7 +144,7 @@ internal sealed partial class LoginService(IConfiguration configuration)
                 "JWT_ISSUER and JWT_AUDIENCE must be configured.");
         }
 
-        var accessTokenMinutes = configuration.GetValue<int?>("JWT_ACCESS_TOKEN_MINUTES") ?? 15;
+        var accessTokenMinutes = configuration.GetValue<int?>("JWT_ACCESS_TOKEN_MINUTES") ?? 480;
         var refreshTokenDays = configuration.GetValue<int?>("JWT_REFRESH_TOKEN_DAYS") ?? 7;
         if (accessTokenMinutes is < 1 or > 1440 || refreshTokenDays is < 1 or > 90)
         {

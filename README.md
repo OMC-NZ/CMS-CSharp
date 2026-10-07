@@ -118,14 +118,76 @@ Authentication configuration:
 | `JWT_SECRET` | Yes | Private signing secret of at least 32 bytes. Never commit its real value. |
 | `JWT_ISSUER` | Yes | JWT issuer. |
 | `JWT_AUDIENCE` | Yes | JWT audience. |
-| `JWT_ACCESS_TOKEN_MINUTES` | No | Access-token lifetime; defaults to 15 minutes. |
+| `JWT_ACCESS_TOKEN_MINUTES` | No | Access-token lifetime; defaults to 480 minutes (8 hours). |
 | `JWT_REFRESH_TOKEN_DAYS` | No | Refresh-token session lifetime; defaults to 7 days. |
+
+### Access Token Validation
+
+Protected endpoints require the access token returned by `POST /api/auth/login`:
+
+```http
+Authorization: Bearer {accessToken}
+```
+
+The authentication middleware validates the HS256 signature, issuer, audience, expiration time, and required `sub`, `user_id`, `sid`, and `security_version` claims. It then checks `accounts`, `users`, and `sessions` through `AuthConnection`. The Account and User must be active; the Session must exist, belong to the Account, be unexpired and not revoked; and the Account, Session, and token security versions must match.
+
+Missing, malformed, expired, revoked, disabled, or otherwise invalid authentication returns `401 Unauthorized`:
+
+```json
+{
+  "success": false,
+  "message": "Authentication is required."
+}
+```
+
+Authentication is required by default for every API endpoint. Only the following endpoints are explicitly public:
+
+- `GET /`
+- `GET /health`
+- `POST /api/auth/login`
+- `GET /api/promotions/eligible`
+- `POST /api/claims`
+
+All other current and future endpoints return `401 Unauthorized` when a valid Bearer access token and active login session are not supplied. Protected business endpoints also enforce the permission mapping documented below.
+
+### Permission Authorization
+
+After JWT and Session validation succeed, the middleware reloads the Account's current active Roles and Permissions from the Auth database. Permission decisions therefore do not rely on permission values that may be stale inside the access token.
+
+An authenticated Account without the required active Permission receives `403 Forbidden`:
+
+```json
+{
+  "success": false,
+  "message": "You do not have permission to perform this action."
+}
+```
+
+Current endpoint permission mapping:
+
+| Permission code | Protected endpoints |
+| --- | --- |
+| `accounts.view` | Account list/search endpoints and `GET /database/status` |
+| `accounts.create` | `POST /api/accounts` |
+| `roles.view` | `GET /api/roles` |
+| `devices.view` | All Device search endpoints |
+| `devices.create` | `POST /api/devices/import` |
+| `devices.edit` | `PATCH /api/devices/{imei}` |
+| `promotions.view` | Channel and Gift lookups, Promotion list, and Promotion details |
+| `promotions.create` | `POST /api/promotions` |
+| `claims.view` | Claim list, search, and view endpoints |
+| `claims.export` | Claim fulfilment endpoints |
+| `claims.edit` | `PATCH /api/claims/{claimId}` |
+| `claims.delete` | `DELETE /api/claims/{claimId}` |
+
+The permission code must exist in `permissions` with `status = 1`, and the Account's active Role must be connected to it through `role_permissions`. A Super Admin must also have these mappings; the Role name alone does not bypass permission checks.
 
 ### Create Account
 
 ```http
 POST /api/accounts
 Content-Type: application/json
+Authorization: Bearer {accessToken}
 ```
 
 Creates one active login account, its associated CMS user profile, and its role assignments in the database configured by `ConnectionStrings:AuthConnection`. All writes use one transaction. The password is stored only as an ASP.NET Core Identity password hash.
@@ -169,15 +231,144 @@ Relevant status codes:
 
 - `201 Created`: Account, user profile, and role assignments were created.
 - `400 Bad Request`: Input validation failed or an active role code was not found.
+- `401 Unauthorized`: The access token or its login session is invalid.
 - `409 Conflict`: The normalized email address already exists.
 - `503 Service Unavailable`: `AuthConnection` is unavailable or a database operation failed.
 
-This endpoint is a bootstrap endpoint until authentication and permission middleware are added. It must be restricted to authorized account administrators before the API is exposed publicly.
+This endpoint requires a valid login and the `accounts.create` Permission.
+
+### Get Accounts
+
+```http
+GET /api/accounts
+Authorization: Bearer {accessToken}
+```
+
+Returns the compact fields needed by the Account list UI: Account ID, email, User display name, Account status, last-login time, and assigned Role names. The endpoint has no query parameters, filtering, pagination, or row limit. It never returns password hashes, access tokens, refresh tokens, or Session secrets. The caller must have `accounts.view`.
+
+Success response: `200 OK`
+
+```json
+{
+  "total": 1,
+  "items": [
+    {
+      "accountId": 1,
+      "email": "admin@example.com",
+      "displayName": "Chris He",
+      "status": 1,
+      "lastLoginAt": "2026-10-07T09:00:00",
+      "roles": ["Super Administrator"]
+    }
+  ]
+}
+```
+
+Filtering rules:
+
+- Accounts are ordered by `accounts.created_at` descending and then Account ID descending.
+- `roles` contains the distinct names of all Roles assigned to the Account.
+- Missing `users.display_name` is returned as `null` instead of removing the Account from the result.
+
+Relevant status codes:
+
+- `200 OK`: Accounts returned; an empty database returns `{ "total": 0, "items": [] }`.
+- `401 Unauthorized`: The access token or Session is invalid.
+- `403 Forbidden`: The Account does not have `accounts.view`.
+- `503 Service Unavailable`: `AuthConnection` is unavailable or the query failed.
+
+### Get Account by ID
+
+```http
+GET /api/accounts/{accountId}
+Authorization: Bearer {accessToken}
+```
+
+Returns one Account selected by its exact positive `accounts.id`, including its User names, Account and User statuses, security version, assigned Role names, and current effective active Permissions. The caller must have `accounts.view`.
+
+Success response: `200 OK`
+
+```json
+{
+  "accountId": 1,
+  "email": "admin@example.com",
+  "firstName": "Chris",
+  "lastName": "He",
+  "displayName": "Chris He",
+  "status": 1,
+  "userStatus": 1,
+  "securityVersion": 1,
+  "lastLoginAt": "2026-10-07T09:00:00",
+  "roles": ["Super Administrator"],
+  "permissions": [
+    {
+      "id": 1,
+      "code": "accounts.view",
+      "module": "accounts",
+      "action": "view"
+    }
+  ]
+}
+```
+
+`permissions` contains only active Permissions inherited through active assigned Roles. `securityVersion` is the Account security revision used to invalidate previously issued Tokens and Sessions after security-sensitive changes.
+
+Relevant status codes:
+
+- `200 OK`: Account returned.
+- `400 Bad Request`: `accountId` is not a positive integer.
+- `401 Unauthorized`: The access token or Session is invalid.
+- `403 Forbidden`: The Account does not have `accounts.view`.
+- `404 Not Found`: No Account has the requested ID.
+- `503 Service Unavailable`: `AuthConnection` is unavailable or the query failed.
+
+### Search Accounts by Email
+
+```http
+GET /api/accounts/search?email={email1}&email={email2}
+Authorization: Bearer {accessToken}
+```
+
+Performs an exact lookup for one or more Account email addresses and returns the same `{ total, items }` response shape as `GET /api/accounts`. It does not return Accounts that were not requested.
+
+Query parameters:
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `email` | Yes | May be supplied once or repeated. Comma-separated and line-separated values are also accepted. Every value is trimmed, lowercased, validated, and matched exactly against `accounts.email`. |
+
+Examples:
+
+```http
+GET /api/accounts/search?email=first@example.com
+```
+
+```http
+GET /api/accounts/search?email=first@example.com&email=second@example.com
+```
+
+Duplicate email inputs are removed case-insensitively. The endpoint has no 50-item application limit. Unknown emails are omitted; if none match, it returns:
+
+```json
+{
+  "total": 0,
+  "items": []
+}
+```
+
+Relevant status codes:
+
+- `200 OK`: Matching Accounts returned.
+- `400 Bad Request`: No email was supplied or one of the values is not a valid email address.
+- `401 Unauthorized`: The access token or Session is invalid.
+- `403 Forbidden`: The Account does not have `accounts.view`.
+- `503 Service Unavailable`: `AuthConnection` is unavailable or the query failed.
 
 ### Get Active Roles
 
 ```http
 GET /api/roles
+Authorization: Bearer {accessToken}
 ```
 
 Returns all roles with `status = 1`, ordered by `name` and then `id`. The endpoint has no inputs. A frontend account form should display the role name and send the selected `code` in the `roleCodes` array to `POST /api/accounts`. The backend resolves each code to its database role ID.
@@ -202,6 +393,8 @@ When no active roles exist, the endpoint returns `200 OK` with an empty array:
 ```
 
 Database or configuration failure response: `503 Service Unavailable`
+
+Missing or invalid authentication response: `401 Unauthorized`
 
 ### Database Connection Status
 
@@ -709,7 +902,7 @@ For one or more Claim IDs in a single request, use:
 GET /api/claims/fulfilment?claimIds={claimId1}&claimIds={claimId2}
 ```
 
-The `claimIds` parameter may be supplied once or repeated, and comma-separated IDs are also accepted. Duplicate IDs are removed case-insensitively, and at most 50 unique IDs may be requested. The original path route remains available for one exact `Claims.id`.
+The `claimIds` parameter may be supplied once or repeated, and comma-separated IDs are also accepted. Duplicate IDs are removed case-insensitively. This exact-ID lookup does not impose a 50-item application limit. The original path route remains available for one exact `Claims.id`.
 
 The endpoint joins `Claims`, `Customers`, `Claim_Gifts`, `Gifts`, and `Deliver_Addresses`. The response is always one flat array with one row per related Claim Gift/SKU. Therefore, two requested Claims with two Gifts each may return four rows. Claim, customer, and delivery values repeat for each Gift. Unknown IDs and Claims without a related Gift are omitted from the batch response; if none match, it returns `200 OK` with `[]`.
 
@@ -749,7 +942,7 @@ Success response: `200 OK`
 
 The single-ID path returns `404 Not Found` for an unknown Claim or a Claim without a related Gift.
 
-Missing IDs, empty IDs, or more than 50 unique IDs response: `400 Bad Request`
+Missing or empty IDs response: `400 Bad Request`
 
 Database or configuration failure response: `503 Service Unavailable`
 

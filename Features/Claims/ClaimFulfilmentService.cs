@@ -24,12 +24,6 @@ internal sealed partial class ClaimFulfilmentService(IConfiguration configuratio
         {
             throw new ClaimValidationException("At least one claimIds query parameter is required.");
         }
-        if (normalizedClaimIds.Length > 50)
-        {
-            throw new ClaimValidationException(
-                "A maximum of 50 Claim IDs can be requested at once.");
-        }
-
         var connectionString = configuration.GetConnectionString("DefaultConnection");
         if (string.IsNullOrWhiteSpace(connectionString))
         {
