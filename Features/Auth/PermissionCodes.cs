@@ -11,6 +11,8 @@ internal static class PermissionCodes
     public const string ClaimsExport = "claims.export";
     public const string PromotionsView = "promotions.view";
     public const string PromotionsCreate = "promotions.create";
+    public const string PromotionsEdit = "promotions.edit";
+    public const string PromotionsDelete = "promotions.delete";
     public const string DevicesView = "devices.view";
     public const string DevicesCreate = "devices.create";
     public const string DevicesEdit = "devices.edit";
@@ -26,6 +28,8 @@ internal static class PermissionCodes
         ClaimsExport,
         PromotionsView,
         PromotionsCreate,
+        PromotionsEdit,
+        PromotionsDelete,
         DevicesView,
         DevicesCreate,
         DevicesEdit

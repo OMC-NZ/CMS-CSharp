@@ -10,6 +10,7 @@ using CMS_CSharp.Data.Repositories;
 using CMS_CSharp.Features.Auth;
 using CMS_CSharp.Features.Claims;
 using CMS_CSharp.Features.Devices;
+using CMS_CSharp.Features.Gifts;
 using CMS_CSharp.Features.Promotions;
 using CMS_CSharp.Features.Promotions.DuplicateDetection;
 using CMS_CSharp.Services.Email;
@@ -165,6 +166,7 @@ builder.Services.AddHostedService(serviceProvider =>
 builder.Services.AddScoped<IReferenceDataRepository, ReferenceDataRepository>();
 builder.Services.AddScoped<PromotionConflictDetector>();
 builder.Services.AddScoped<PromotionCreationService>();
+builder.Services.AddScoped<PromotionUpdateService>();
 builder.Services.AddScoped<PromotionListService>();
 builder.Services.AddScoped<PromotionDetailsService>();
 builder.Services.AddScoped<EligiblePromotionLookupService>();
@@ -177,6 +179,7 @@ builder.Services.AddScoped<ClaimDeletionService>();
 builder.Services.AddScoped<DeviceImportService>();
 builder.Services.AddScoped<DeviceLookupService>();
 builder.Services.AddScoped<DeviceUpdateService>();
+builder.Services.AddScoped<GiftManagementService>();
 builder.Services.AddScoped<AccountCreationService>();
 builder.Services.AddScoped<RoleLookupService>();
 builder.Services.AddScoped<LoginService>();
@@ -650,7 +653,7 @@ app.MapGet("/api/devices/search/model", async (
         app,
         () => deviceLookupService.FindByModelAsync(model, cancellationToken),
         "Device model search failed."))
-.WithName("SearchDevicesByExactModel")
+.WithName("SearchDevicesByModel")
 .RequireAuthorization(PermissionCodes.DevicesView);
 
 app.MapGet("/api/devices/search/market-name", async (
@@ -834,18 +837,144 @@ app.MapGet("/api/channels", async (
 .RequireAuthorization(PermissionCodes.PromotionsView);
 
 app.MapGet("/api/gifts/search", async (
-    string name,
+    string? keyword,
+    string? name,
+    GiftManagementService giftManagementService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        return Results.Ok(string.IsNullOrWhiteSpace(keyword)
+            ? await giftManagementService.SearchByNameAsync(name, cancellationToken)
+            : await giftManagementService.SearchAsync(keyword, cancellationToken));
+    }
+    catch (GiftValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning("Gift search failed: {ErrorMessage}", exception.Message);
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Gift search failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("SearchGifts")
+.RequireAuthorization(PermissionCodes.PromotionsView);
+
+app.MapPost("/api/gifts", async (
+    CreateGiftRequest request,
+    GiftManagementService giftManagementService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var gift = await giftManagementService.CreateAsync(request, cancellationToken);
+        return Results.Json(gift, statusCode: StatusCodes.Status201Created);
+    }
+    catch (GiftValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (GiftConflictException exception)
+    {
+        return Results.Conflict(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning("Gift creation failed: {ErrorMessage}", exception.Message);
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Gift creation failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("CreateGift")
+.RequireAuthorization(PermissionCodes.PromotionsCreate);
+
+app.MapPatch("/api/gifts/{id:int}", async (
+    int id,
+    UpdateGiftRequest request,
+    GiftManagementService giftManagementService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var gift = await giftManagementService.UpdateAsync(id, request, cancellationToken);
+        return gift is null
+            ? Results.NotFound(new { error = "Gift was not found." })
+            : Results.Ok(gift);
+    }
+    catch (GiftValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (GiftConflictException exception)
+    {
+        return Results.Conflict(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning("Gift update failed: {ErrorMessage}", exception.Message);
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Gift update failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("UpdateGiftById")
+.RequireAuthorization(PermissionCodes.PromotionsEdit);
+
+app.MapDelete("/api/gifts/{id:int}", async (
+    int id,
+    GiftManagementService giftManagementService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var result = await giftManagementService.DeleteAsync(id, cancellationToken);
+        return result is null
+            ? Results.NotFound(new { error = "Gift was not found." })
+            : Results.Ok(result);
+    }
+    catch (GiftValidationException exception)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (GiftConflictException exception)
+    {
+        return Results.Conflict(new { error = exception.Message });
+    }
+    catch (Exception exception) when (
+        exception is MySqlException or InvalidOperationException or ArgumentException)
+    {
+        app.Logger.LogWarning("Gift deletion failed: {ErrorMessage}", exception.Message);
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Gift deletion failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("DeleteGiftById")
+.RequireAuthorization(PermissionCodes.PromotionsDelete);
+
+app.MapGet("/api/gifts", async (
     IConfiguration configuration,
     CancellationToken cancellationToken) =>
 {
-    if (string.IsNullOrWhiteSpace(name))
-    {
-        return Results.BadRequest(new
-        {
-            error = "The name query parameter is required."
-        });
-    }
-
     var connectionString = configuration.GetConnectionString("DefaultConnection");
     if (string.IsNullOrWhiteSpace(connectionString))
     {
@@ -857,7 +986,7 @@ app.MapGet("/api/gifts/search", async (
 
     try
     {
-        var gifts = new List<GiftSearchResult>();
+        var gifts = new List<GiftGetResult>();
         var mysqlConnectionString = NormalizeMySqlConnectionString(connectionString);
 
         await using var connection = new MySqlConnection(mysqlConnectionString);
@@ -865,29 +994,29 @@ app.MapGet("/api/gifts/search", async (
 
         await using var command = connection.CreateCommand();
         command.CommandText = """
-            SELECT DISTINCT
+            SELECT
+                id,
                 name,
                 alias,
                 color,
-                status
+                status,
+                updated_at
             FROM Gifts
-            WHERE name LIKE CONCAT('%', @name, '%') ESCAPE '='
-            ORDER BY name, alias, color, status;
+            ORDER BY updated_at DESC, name, alias;
             """;
-        command.Parameters.Add(
-            new MySqlParameter("@name", MySqlDbType.VarChar)
-            {
-                Value = EscapeLikePattern(name.Trim())
-            });
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
-            gifts.Add(new GiftSearchResult(
+            gifts.Add(new GiftGetResult(
+                reader.GetInt32("id"),
                 reader.GetString("name"),
                 reader.GetString("alias"),
                 reader.GetString("color"),
-                reader.GetSByte("status")));
+                reader.GetSByte("status"),
+                reader.IsDBNull(reader.GetOrdinal("updated_at"))
+                    ? null
+                    : reader.GetDateTime("updated_at")));
         }
 
         return Results.Ok(gifts);
@@ -895,18 +1024,18 @@ app.MapGet("/api/gifts/search", async (
     catch (Exception exception) when (exception is MySqlException or InvalidOperationException or ArgumentException)
     {
         app.Logger.LogWarning(
-            "Gift search failed: {ErrorMessage}",
+            "Getting gifts failed: {ErrorMessage}",
             exception.Message);
 
         return Results.Json(new
         {
             error = app.Environment.IsDevelopment()
                 ? exception.Message
-                : "Gift search failed."
+                : "Getting gifts failed."
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 })
-.WithName("SearchGiftsByName")
+.WithName("GetGifts")
 .RequireAuthorization(PermissionCodes.PromotionsView);
 
 app.MapGet("/api/promotions", async (
@@ -1035,6 +1164,74 @@ app.MapPost("/api/promotions", async (
 })
 .WithName("CreatePromotion")
 .RequireAuthorization(PermissionCodes.PromotionsCreate);
+
+app.MapPatch("/api/promotions/{promotionId:int}", async (
+    int promotionId,
+    HttpRequest httpRequest,
+    PromotionUpdateService promotionUpdateService,
+    CancellationToken cancellationToken) =>
+{
+    if (!httpRequest.HasFormContentType)
+    {
+        return Results.Json(new
+        {
+            error = "Content-Type must be multipart/form-data."
+        }, statusCode: StatusCodes.Status415UnsupportedMediaType);
+    }
+
+    try
+    {
+        var form = await httpRequest.ReadFormAsync(cancellationToken);
+        var command = new UpdatePromotionCommand(
+            GetOptionalFormValue(form, "name"),
+            GetOptionalFormValue(form, "description"),
+            DeserializeOptionalPromotionList<PromotionProductInput>(form, "products"),
+            DeserializeOptionalPromotionList<PromotionChannelInput>(form, "channels"),
+            DeserializeOptionalPromotionList<PromotionGiftInput>(form, "gifts"),
+            GetOptionalFormValue(form, "termsAction"),
+            form.Files.GetFile("terms"),
+            form.Files.GetFile("banner"));
+
+        var result = await promotionUpdateService.UpdateAsync(
+            promotionId,
+            command,
+            cancellationToken);
+        return result is null
+            ? Results.NotFound(new { error = "Promotion was not found." })
+            : Results.Ok(result);
+    }
+    catch (PromotionConflictException exception)
+    {
+        return Results.Conflict(new
+        {
+            error = exception.Message,
+            existingPromotion = new
+            {
+                id = exception.Conflict.PromotionId,
+                name = exception.Conflict.Name,
+                slugUrl = exception.Conflict.SlugUrl
+            },
+            overlappingChannelCodes = exception.Conflict.OverlappingChannelCodes
+        });
+    }
+    catch (Exception exception) when (
+        exception is PromotionValidationException or JsonException)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception)
+    {
+        app.Logger.LogError(exception, "Promotion update failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Promotion update failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("UpdatePromotion")
+.RequireAuthorization(PermissionCodes.PromotionsEdit);
 
 app.MapGet("/api/promotions/eligible", async (
     string? imei,
@@ -1543,6 +1740,29 @@ static IReadOnlyList<T>? DeserializeOptionalList<T>(
         json,
         new JsonSerializerOptions(JsonSerializerDefaults.Web))
         ?? throw new ClaimValidationException(
+            $"The {fieldName} form field must be a JSON array.");
+}
+
+static IReadOnlyList<T>? DeserializeOptionalPromotionList<T>(
+    IFormCollection form,
+    string fieldName)
+{
+    if (!form.ContainsKey(fieldName))
+    {
+        return null;
+    }
+
+    var json = form[fieldName].ToString();
+    if (string.IsNullOrWhiteSpace(json))
+    {
+        throw new PromotionValidationException(
+            $"The {fieldName} form field must be a JSON array when provided.");
+    }
+
+    return JsonSerializer.Deserialize<List<T>>(
+        json,
+        new JsonSerializerOptions(JsonSerializerDefaults.Web))
+        ?? throw new PromotionValidationException(
             $"The {fieldName} form field must be a JSON array.");
 }
 

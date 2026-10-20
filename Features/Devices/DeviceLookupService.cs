@@ -31,8 +31,13 @@ internal sealed partial class DeviceLookupService(IConfiguration configuration)
         var values = ExpandValues(models, "model", StringComparer.OrdinalIgnoreCase);
         var normalized = values.Select(NormalizeModel)
             .Distinct(StringComparer.Ordinal)
+            .Select(EscapeLikePattern)
             .ToArray();
-        return SearchAsync(CreateInPredicate("UPPER(d.model)", normalized.Length), normalized,
+        return SearchAsync(
+            string.Join(" OR ", Enumerable.Range(0, normalized.Length)
+                .Select(index =>
+                    $"UPPER(d.model) LIKE CONCAT('%', @value{index}, '%') ESCAPE '='")),
+            normalized,
             cancellationToken);
     }
 

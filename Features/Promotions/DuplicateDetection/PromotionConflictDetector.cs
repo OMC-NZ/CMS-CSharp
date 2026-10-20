@@ -8,12 +8,14 @@ internal sealed class PromotionConflictDetector
         MySqlConnection connection,
         MySqlTransaction transaction,
         PromotionComparisonData incoming,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        long? excludedPromotionId = null)
     {
         var candidates = await FindCandidatesWithEqualSetsAsync(
             connection,
             transaction,
             incoming,
+            excludedPromotionId,
             cancellationToken);
 
         var overlapsByPromotion = await FindOverlappingChannelCodesAsync(
@@ -43,6 +45,7 @@ internal sealed class PromotionConflictDetector
         MySqlConnection connection,
         MySqlTransaction transaction,
         PromotionComparisonData incoming,
+        long? excludedPromotionId,
         CancellationToken cancellationToken)
     {
         var modelParameters = CreateParameterNames("model", incoming.Models.Count);
@@ -52,7 +55,8 @@ internal sealed class PromotionConflictDetector
         var sql = $"""
             SELECT p.id, p.name, p.slug_url
             FROM Promotions p
-            WHERE (SELECT COUNT(DISTINCT pd.eligible_model)
+            WHERE (@excludedPromotionId IS NULL OR p.id <> @excludedPromotionId)
+              AND (SELECT COUNT(DISTINCT pd.eligible_model)
                    FROM Promotion_Devices pd
                    WHERE pd.promotion_id = p.id) = @modelCount
               {CreateNoOutsideValuesClause("Promotion_Devices", "eligible_model", modelParameters)}
@@ -70,6 +74,9 @@ internal sealed class PromotionConflictDetector
         command.Parameters.AddWithValue("@modelCount", incoming.Models.Count);
         command.Parameters.AddWithValue("@channelCount", incoming.Channels.Count);
         command.Parameters.AddWithValue("@giftCount", incoming.GiftIds.Count);
+        command.Parameters.AddWithValue(
+            "@excludedPromotionId",
+            excludedPromotionId.HasValue ? excludedPromotionId.Value : DBNull.Value);
         AddParameters(command, modelParameters, incoming.Models.Cast<object>().ToArray());
         AddParameters(
             command,

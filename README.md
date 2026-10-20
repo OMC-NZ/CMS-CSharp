@@ -174,7 +174,9 @@ Current endpoint permission mapping:
 | `devices.create` | `POST /api/devices/import` |
 | `devices.edit` | `PATCH /api/devices/{imei}` |
 | `promotions.view` | Channel and Gift lookups, Promotion list, and Promotion details |
-| `promotions.create` | `POST /api/promotions` |
+| `promotions.create` | `POST /api/promotions` and `POST /api/gifts` |
+| `promotions.edit` | `PATCH /api/promotions/{promotionId}` and `PATCH /api/gifts/{id}` |
+| `promotions.delete` | `DELETE /api/gifts/{id}` |
 | `claims.view` | Claim list, search, and view endpoints |
 | `claims.export` | Claim fulfilment endpoints |
 | `claims.edit` | `PATCH /api/claims/{claimId}` |
@@ -703,6 +705,90 @@ Non-multipart request response: `415 Unsupported Media Type`
 
 Database or R2 failure response: `503 Service Unavailable`
 
+### Update Promotion
+
+```http
+PATCH /api/promotions/{promotionId}
+Content-Type: multipart/form-data
+```
+
+Partially updates one existing Promotion. The positive integer `promotionId` identifies `Promotions.id`. Every form field is optional, but the request must contain at least one effective change. The endpoint requires a valid Bearer access token and the `promotions.edit` permission.
+
+Multipart form fields:
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | Text | No | Replaces `Promotions.name`. An empty supplied value is rejected. The existing `slug_url` is preserved. |
+| `description` | Text | No | Replaces `Promotions.description`. An empty supplied value is rejected. |
+| `products` | JSON array text | No | Final complete Device model list. Omission keeps the current list; `[]` removes every model. |
+| `channels` | JSON array text | No | Final complete Channel and period list. Omission keeps the current list; `[]` removes every Channel period. |
+| `gifts` | JSON array text | No | Final complete Gift alias list. Omission keeps the current list; `[]` removes every Gift. |
+| `banner` | File | No | Replaces the banner with a non-empty image. The new file is UUID-renamed and uploaded to `banners/Promotions/`. |
+| `termsAction` | Text | No | `keep` (default), `upload`, or `delete`. |
+| `terms` | File | Conditional | Required only when `termsAction=upload`; rejected for `keep` or `delete`. |
+
+Array examples:
+
+```json
+products = [{"model":"CPH2831"},{"model":"CPH2717"}]
+```
+
+```json
+channels = [
+  {"code":"SPK","startDate":"2026-11-01","endDate":"2026-11-30"},
+  {"code":"NLG","startDate":"2026-12-01","endDate":"2026-12-31"}
+]
+```
+
+```json
+gifts = [{"alias":"WATCH BLACK"},{"alias":"ENCO AIR4 WHITE"}]
+```
+
+Relationship replacement rules:
+
+- An omitted array leaves that relationship unchanged.
+- A supplied array is the final desired state, not an add-only list.
+- A supplied empty array removes every corresponding relationship.
+- When either `products` or `channels` is supplied, the endpoint recalculates both effective Device and Channel relationships so that only model/channel combinations found in `Devices` are stored.
+- Unknown Channel codes and models that do not match a submitted Channel are skipped and reported in the success counts.
+- Every submitted Gift alias must exist; an unknown alias rejects the request with `400 Bad Request`.
+- Channel `startDate` is stored at `00:00:00`, `endDate` at `23:59:59`, and `redeem_end_date` at `23:59:59` exactly 14 calendar days after `endDate`.
+- Duplicate and overlapping Promotion detection uses the final model, Channel, period, and Gift sets and excludes the Promotion currently being edited.
+
+Terms behavior:
+
+- `keep` or omitted: keeps the existing Terms value and file.
+- `upload`: requires a `terms` file, UUID-renames it, uploads it to `terms/Promotions/`, and replaces `Promotions.terms_url`.
+- `delete`: sets `Promotions.terms_url` to `/terms` and removes the previous custom Terms object from R2 after the database transaction commits.
+
+File replacement behavior:
+
+- New files are uploaded before the database update.
+- A database failure rolls back all database changes and removes newly uploaded files.
+- Old banner or custom Terms objects are deleted only after the database transaction succeeds.
+- Omitting `banner` keeps the current banner.
+
+Success response: `200 OK`
+
+```json
+{
+  "success": true,
+  "promotionId": 249,
+  "updatedFields": ["name", "banner", "terms", "products", "channels", "gifts"],
+  "productCount": 2,
+  "skippedProductCount": 0,
+  "channelCount": 2,
+  "skippedChannelCount": 0,
+  "giftCount": 2
+}
+```
+
+- Invalid ID, empty update, malformed JSON, invalid date, invalid file, or invalid relationship: `400 Bad Request`
+- Promotion not found: `404 Not Found`
+- Final relationship sets conflict with an overlapping existing Promotion: `409 Conflict`
+- Non-multipart request: `415 Unsupported Media Type`
+- Database or R2 failure: `503 Service Unavailable`
+
 ### Get Claims
 
 ```http
@@ -1192,7 +1278,7 @@ Performs exact matches against `Devices.imei`. At least one `imei` is required a
 GET /api/devices/search/model?model={model1}&model={model2}
 ```
 
-Performs case-insensitive exact matches against `Devices.model`. Supply multiple values by repeating `model`. Each value may be supplied as `CPH1234`, `cph1234`, or `1234`. The backend trims it, converts it to uppercase, and adds the `CPH` prefix when only digits are supplied. Other formats return `400 Bad Request`, and duplicate normalized models are ignored.
+Performs case-insensitive contains searches against `Devices.model`. Supply multiple values by repeating `model`. Each value may be supplied as `CPH1234`, `cph1234`, or digits such as `1234`. The backend trims it, converts it to uppercase, and adds the `CPH` prefix when only digits are supplied. Partial values are supported, so `123` searches for models containing `CPH123`. Other formats return `400 Bad Request`, duplicate normalized values are ignored, and `%`, `_`, and the escape character are treated as literal search text.
 
 ### Search Device Records by Market Name
 
@@ -1327,6 +1413,12 @@ Database failure response: `503 Service Unavailable`
 ### Search Gifts
 
 ```http
+GET /api/gifts/search?keyword={keyword}
+```
+
+Backward-compatible name-only form:
+
+```http
 GET /api/gifts/search?name={name}
 ```
 
@@ -1334,9 +1426,10 @@ Query parameters:
 
 | Parameter | Required | Description |
 | --- | --- | --- |
-| `name` | Yes | Performs a contains search against `Gifts.name`. |
+| `keyword` | Conditional | Performs a contains search against both `Gifts.name` and `Gifts.alias`. |
+| `name` | Conditional | Preserved for backward compatibility and performs a contains search against only `Gifts.name`. |
 
-Identical results are merged by `name + alias + color + status`.
+At least one of `keyword` or `name` is required. When both are supplied, `keyword` takes precedence. The search uses the database collation for case sensitivity. `%`, `_`, and the escape character are treated as literal search text. No status filter or result limit is applied. Results are ordered by `updated_at` descending, then by `name` and `alias`.
 
 Gift status values:
 
@@ -1347,7 +1440,7 @@ Gift status values:
 Example request:
 
 ```http
-GET /api/gifts/search?name=Watch
+GET /api/gifts/search?keyword=Watch
 ```
 
 Success response: `200 OK`
@@ -1355,17 +1448,138 @@ Success response: `200 OK`
 ```json
 [
   {
+    "id": 123,
     "name": "OPPO Watch",
-    "alias": "Watch",
+    "alias": "WATCH BLACK",
     "color": "Black",
-    "status": 0
+    "status": 0,
+    "updatedAt": "2026-10-20T10:30:00"
   }
 ]
 ```
 
-Missing or empty parameter response: `400 Bad Request`
+Both `keyword` and `name` missing or empty response: `400 Bad Request`
 
 Database failure response: `503 Service Unavailable`
+
+Requires a valid Bearer access token and the `promotions.view` permission.
+
+### Get Gifts
+
+```http
+GET /api/gifts
+```
+
+Returns all Gifts. The endpoint does not accept query parameters or apply status filtering. Results are ordered by `updated_at` descending, then by `name` and `alias`.
+
+Success response: `200 OK`
+
+```json
+[
+  {
+    "id": 123,
+    "name": "OPPO Watch",
+    "alias": "Watch",
+    "color": "Black",
+    "status": 0,
+    "updatedAt": "2026-10-20T10:30:00"
+  }
+]
+```
+
+Gift status values:
+
+- `0`: Available and active.
+- `1`: No longer offered and should not be selected for new claims.
+- `2`: Temporarily out of stock.
+
+Authentication and authorization:
+
+- Requires a valid Bearer access token.
+- Requires the `promotions.view` permission.
+
+Database or configuration failure response: `503 Service Unavailable`
+
+### Create Gift
+
+```http
+POST /api/gifts
+Content-Type: application/json
+```
+
+Request body:
+
+```json
+{
+  "name": "OPPO Watch",
+  "alias": "WATCH BLACK",
+  "color": "Black"
+}
+```
+
+All three fields are required. `name`, `alias`, and `color` are trimmed and may contain at most 45 characters. `alias` must be unique. The backend always creates the Gift with `status = 0`; the client does not send `status`. `updated_at` is set by the database to the current timestamp.
+
+Success response: `201 Created`, containing the created Gift in the same shape as `GET /api/gifts`.
+
+- Invalid input: `400 Bad Request`
+- Duplicate alias: `409 Conflict`
+- Database or configuration failure: `503 Service Unavailable`
+- Requires a valid Bearer access token and the `promotions.create` permission.
+
+### Update Gift
+
+```http
+PATCH /api/gifts/{id}
+Content-Type: application/json
+```
+
+The positive integer route `id` identifies the existing Gift by `Gifts.id`.
+
+Request body example:
+
+```json
+{
+  "name": "OPPO Watch X2",
+  "alias": "WATCH X2 BLACK",
+  "color": "Black",
+  "status": 2
+}
+```
+
+Every request field is optional, but at least one of `name`, `alias`, `color`, or `status` must be supplied. Only supplied fields are changed. String values are trimmed, empty supplied strings are rejected, the 45-character limits apply, and `status` must be `0`, `1`, or `2`. When `alias` is supplied, it becomes the new unique alias. `updated_at` is set to the current database timestamp.
+
+Success response: `200 OK`, containing the updated Gift in the same shape as `GET /api/gifts`.
+
+- ID is zero or negative, invalid input, or an empty update: `400 Bad Request`
+- Gift not found: `404 Not Found`
+- Duplicate replacement alias: `409 Conflict`
+- Database or configuration failure: `503 Service Unavailable`
+- Requires a valid Bearer access token and the `promotions.edit` permission.
+
+### Delete Gift
+
+```http
+DELETE /api/gifts/{id}
+```
+
+The positive integer route `id` identifies one Gift by `Gifts.id`. The endpoint deletes only the matching row from `Gifts`; it never deletes related Promotion or Claim data.
+
+Deletion is rejected when the Gift is referenced by `Promotion_Gifts` or `Claim_Gifts`.
+
+Success response: `200 OK`
+
+```json
+{
+  "success": true,
+  "id": 123
+}
+```
+
+- ID is zero or negative: `400 Bad Request`
+- Gift not found: `404 Not Found`
+- Gift is used by an existing Promotion or Claim: `409 Conflict`
+- Database or configuration failure: `503 Service Unavailable`
+- Requires a valid Bearer access token and the `promotions.delete` permission.
 
 ### Get Channels
 
