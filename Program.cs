@@ -10,6 +10,7 @@ using CMS_CSharp.Data.Repositories;
 using CMS_CSharp.Features.Auth;
 using CMS_CSharp.Features.Claims;
 using CMS_CSharp.Features.Devices;
+using CMS_CSharp.Features.Events;
 using CMS_CSharp.Features.Gifts;
 using CMS_CSharp.Features.Promotions;
 using CMS_CSharp.Features.Promotions.DuplicateDetection;
@@ -168,6 +169,7 @@ builder.Services.AddScoped<PromotionConflictDetector>();
 builder.Services.AddScoped<PromotionCreationService>();
 builder.Services.AddScoped<PromotionUpdateService>();
 builder.Services.AddScoped<PromotionListService>();
+builder.Services.AddScoped<EventListService>();
 builder.Services.AddScoped<PromotionDetailsService>();
 builder.Services.AddScoped<EligiblePromotionLookupService>();
 builder.Services.AddScoped<ClaimCreationService>();
@@ -1037,6 +1039,28 @@ app.MapGet("/api/gifts", async (
 })
 .WithName("GetGifts")
 .RequireAuthorization(PermissionCodes.PromotionsView);
+
+app.MapGet("/api/events", async (
+    EventListService eventListService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        return Results.Ok(await eventListService.GetAsync(cancellationToken));
+    }
+    catch (Exception exception) when (exception is not OperationCanceledException)
+    {
+        app.Logger.LogError(exception, "Event list lookup failed.");
+        return Results.Json(new
+        {
+            error = app.Environment.IsDevelopment()
+                ? exception.Message
+                : "Event list lookup failed."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("GetEvents")
+.RequireAuthorization(PermissionCodes.EventsView);
 
 app.MapGet("/api/promotions", async (
     PromotionListService promotionListService,

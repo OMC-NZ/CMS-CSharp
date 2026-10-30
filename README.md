@@ -174,6 +174,7 @@ Current endpoint permission mapping:
 | `devices.create` | `POST /api/devices/import` |
 | `devices.edit` | `PATCH /api/devices/{imei}` |
 | `promotions.view` | Channel and Gift lookups, Promotion list, and Promotion details |
+| `events.view` | `GET /api/events` |
 | `promotions.create` | `POST /api/promotions` and `POST /api/gifts` |
 | `promotions.edit` | `PATCH /api/promotions/{promotionId}` and `PATCH /api/gifts/{id}` |
 | `promotions.delete` | `DELETE /api/gifts/{id}` |
@@ -505,6 +506,38 @@ Invalid or missing IMEI response: `400 Bad Request`
 Unknown IMEI response: `404 Not Found`
 
 Database or configuration failure response: `503 Service Unavailable`
+
+### List Events
+
+```http
+GET /api/events
+```
+
+Returns all Events ordered by `Events.id` descending, with no date filter, status filter, or row limit. No inputs are required. This Setup list contains only Event summary fields; it does not load related Channels, Models, dynamic form configuration, or Claims.
+
+Requires a valid Bearer access token and the `events.view` permission assigned through the Auth database.
+
+Success response: `200 OK`
+
+```json
+[
+  {
+    "id": 12,
+    "name": "OPPO Experience Event",
+    "bannerUrl": "https://assets.example.com/banners/Events/imgs/banner.webp",
+    "startDate": "2026-11-01 00:00:00",
+    "endDate": "2026-11-30 23:59:59",
+    "status": "upcoming",
+    "updatedAt": "2026-10-30 10:30:00"
+  }
+]
+```
+
+Fields come from `Events.id`, `name`, `banner_url`, `start_date`, `end_date`, and `updated_at`. Existing absolute HTTP(S) banner URLs are preserved. For relative values, the filename is extracted and joined to `R2_PUBLIC_ASSETS_URL` under `banners/Events/imgs/`; empty values return `null`.
+
+Dates use `yyyy-MM-dd HH:mm:ss`. Activity status compares the current Pacific/Auckland time with the stored Event date values: `upcoming` before the start, `active` from start through end inclusive, and `ended` after the end. A missing start or end date returns `status: null`; nullable dates return `null`.
+
+No Events returns `200 OK` with `[]`. Missing or invalid authentication returns `401`; missing permission returns `403`. Database or required R2 public URL configuration failures return `503` with an `error` message.
 
 ### List Promotions
 
