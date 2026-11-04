@@ -170,6 +170,7 @@ builder.Services.AddScoped<PromotionCreationService>();
 builder.Services.AddScoped<PromotionUpdateService>();
 builder.Services.AddScoped<PromotionListService>();
 builder.Services.AddScoped<EventListService>();
+builder.Services.AddScoped<EventCreationService>();
 builder.Services.AddScoped<PromotionDetailsService>();
 builder.Services.AddScoped<EligiblePromotionLookupService>();
 builder.Services.AddScoped<ClaimCreationService>();
@@ -1040,6 +1041,42 @@ app.MapGet("/api/gifts", async (
 .WithName("GetGifts")
 .RequireAuthorization(PermissionCodes.PromotionsView);
 
+app.MapPost("/api/events", async (
+    HttpRequest request,
+    EventCreationService eventCreationService,
+    CancellationToken cancellationToken) =>
+{
+    if (request.ContentType?.StartsWith("multipart/form-data", StringComparison.OrdinalIgnoreCase) != true)
+        return Results.Json(new { error = "Content-Type must be multipart/form-data." },
+            statusCode: StatusCodes.Status415UnsupportedMediaType);
+    try
+    {
+        var form = await request.ReadFormAsync(cancellationToken);
+        if (string.IsNullOrWhiteSpace(form["data"].ToString()))
+            throw new EventValidationException("data is required and must contain an Event JSON object.");
+        var data = JsonSerializer.Deserialize<CreateEventRequest>(form["data"].ToString(),
+            new JsonSerializerOptions(JsonSerializerDefaults.Web))
+            ?? throw new EventValidationException("data must contain an Event JSON object.");
+        if (form.Files.GetFiles("banner").Count != 1 || form.Files.GetFiles("terms").Count > 1)
+            throw new EventValidationException("Provide exactly one banner file and at most one terms file.");
+        var result = await eventCreationService.CreateAsync(data, form.Files.GetFile("banner")!,
+            form["terms"].FirstOrDefault(), form.Files.GetFile("terms"), cancellationToken);
+        return Results.Json(result, statusCode: StatusCodes.Status201Created);
+    }
+    catch (Exception exception) when (exception is EventValidationException or JsonException or InvalidDataException)
+    {
+        return Results.BadRequest(new { error = exception.Message });
+    }
+    catch (Exception exception) when (exception is not OperationCanceledException)
+    {
+        app.Logger.LogError(exception, "Event creation failed.");
+        return Results.Json(new { error = app.Environment.IsDevelopment()
+            ? exception.Message : "Event creation failed." }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("CreateEvent")
+.RequireAuthorization(PermissionCodes.EventsCreate);
+
 app.MapGet("/api/events", async (
     EventListService eventListService,
     CancellationToken cancellationToken) =>
@@ -1516,6 +1553,49 @@ app.MapGet("/api/claims/search/reference", async (
 })
 .WithName("SearchClaimsByReference")
 .RequireAuthorization(PermissionCodes.ClaimsView);
+
+app.MapPost("/api/claims/{claimId}/confirmation-email", async (
+    string claimId,
+    SendClaimEmailRequest request,
+    IClaimConfirmationEmailService emailService,
+    CancellationToken cancellationToken) =>
+{
+    try
+    {
+        var id = CommonInputRules.NormalizeRequiredAscii(claimId, "claimId");
+        var name = CommonInputRules.NormalizeRequiredAscii(request.Name ?? string.Empty, "name");
+        var email = CommonInputRules.NormalizeEmail(request.Email ?? string.Empty);
+        var gift = CommonInputRules.NormalizeRequiredAscii(request.Gift ?? string.Empty, "gift");
+        var address = CommonInputRules.NormalizeRequiredAscii(request.Address ?? string.Empty, "address");
+        var sent = await emailService.SendManualAsync(
+            id, name, email, gift, address, cancellationToken);
+        if (sent is null)
+            return Results.NotFound(new { success = false, error = "Claim was not found." });
+        if (!sent.Value)
+            return Results.Json(new
+            {
+                success = false,
+                error = "Unable to send the claim confirmation email or record its status."
+            }, statusCode: StatusCodes.Status503ServiceUnavailable);
+
+        return Results.Ok(new { success = true, claimId = id, emailStatus = 1 });
+    }
+    catch (InputValidationException exception)
+    {
+        return Results.BadRequest(new { success = false, error = exception.Message });
+    }
+    catch (Exception exception) when (exception is not OperationCanceledException)
+    {
+        app.Logger.LogError(exception, "Manual claim confirmation email failed for {ClaimId}.", claimId);
+        return Results.Json(new
+        {
+            success = false,
+            error = "Unable to send the claim confirmation email."
+        }, statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+})
+.WithName("SendClaimConfirmationEmail")
+.RequireAuthorization(PermissionCodes.ClaimsEdit);
 
 app.MapGet("/api/claims/view/{claimId}", async (
     string claimId,

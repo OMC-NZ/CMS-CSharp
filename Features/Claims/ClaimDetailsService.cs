@@ -33,6 +33,7 @@ internal sealed partial class ClaimDetailsService(
                 p.name AS promotion_name,
                 dev.market_name,
                 c.status,
+                c.email_status,
                 ct.email,
                 ct.contact,
                 ha.street,
@@ -80,6 +81,9 @@ internal sealed partial class ClaimDetailsService(
                 reader.GetString("promotion_name"),
                 GetNullableString(reader, "market_name"),
                 reader.GetString("email"),
+                reader.IsDBNull(reader.GetOrdinal("email_status"))
+                    ? null
+                    : Convert.ToInt32(reader.GetValue(reader.GetOrdinal("email_status"))),
                 reader.GetString("contact"),
                 GetNullableString(reader, "street") ?? string.Empty,
                 GetNullableString(reader, "suburb") ?? string.Empty,
@@ -102,7 +106,7 @@ internal sealed partial class ClaimDetailsService(
         var imeiCopy = await imeiCopyTask;
 
         return new ClaimDetailsResult(
-            normalizedClaimId, row.PromotionName, row.MarketName, row.Email, row.Contact,
+            normalizedClaimId, row.PromotionName, row.MarketName, row.Email, row.EmailStatus, row.Contact,
             row.Street, row.Suburb, row.City, row.Postcode, row.Instructions, row.FullAddress,
             giftAliases, receipt.PublicUrl, receipt.Sha256, imeiCopy.PublicUrl, imeiCopy.Sha256,
             row.Reference, row.TrackLink);
@@ -153,7 +157,7 @@ internal sealed partial class ClaimDetailsService(
     private static partial Regex ConnectionPortRegex();
 
     private sealed record ClaimRow(
-        int PromotionId, string PromotionName, string? MarketName, string Email, string Contact,
+        int PromotionId, string PromotionName, string? MarketName, string Email, int? EmailStatus, string Contact,
         string Street, string Suburb, string City, string Postcode, string Instructions,
         string FullAddress, string ReceiptValue, string ImeiCopyValue,
         string? Reference, string? TrackLink);
@@ -164,6 +168,7 @@ internal sealed record ClaimDetailsResult(
     string PromotionName,
     string? MarketName,
     string Email,
+    int? EmailStatus,
     string Contact,
     string Street,
     string Suburb,

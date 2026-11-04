@@ -17,12 +17,36 @@ internal sealed partial class ClaimConfirmationEmailService(
     public async Task<bool> SendAsync(
         string claimId,
         CancellationToken cancellationToken = default)
+        => await SendCoreAsync(claimId, null, cancellationToken);
+
+    public async Task<bool?> SendManualAsync(
+        string claimId,
+        string name,
+        string email,
+        string gift,
+        string address,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = new MySqlCommand(
+            "SELECT 1 FROM Claims WHERE id = @claimId LIMIT 1;", connection);
+        command.Parameters.AddWithValue("@claimId", claimId);
+        if (await command.ExecuteScalarAsync(cancellationToken) is null) return null;
+
+        return await SendCoreAsync(
+            claimId, new ClaimEmailData(claimId, name, email, gift, address), cancellationToken);
+    }
+
+    private async Task<bool> SendCoreAsync(
+        string claimId,
+        ClaimEmailData? suppliedData,
+        CancellationToken cancellationToken)
     {
         ClaimEmailData? data = null;
         try
         {
             var settings = GetSettings();
-            data = await LoadClaimDataAsync(claimId, cancellationToken);
+            data = suppliedData ?? await LoadClaimDataAsync(claimId, cancellationToken);
             if (data is null)
             {
                 throw new InvalidOperationException(
@@ -44,7 +68,8 @@ internal sealed partial class ClaimConfirmationEmailService(
 
             try
             {
-                await UpdateEmailStatusAsync(claimId, emailStatus: false, cancellationToken);
+                if (suppliedData is null)
+                    await UpdateEmailStatusAsync(claimId, emailStatus: false, cancellationToken);
             }
             catch (Exception statusException)
             {

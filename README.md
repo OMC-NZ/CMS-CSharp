@@ -175,12 +175,13 @@ Current endpoint permission mapping:
 | `devices.edit` | `PATCH /api/devices/{imei}` |
 | `promotions.view` | Channel and Gift lookups, Promotion list, and Promotion details |
 | `events.view` | `GET /api/events` |
+| `events.create` | `POST /api/events` |
 | `promotions.create` | `POST /api/promotions` and `POST /api/gifts` |
 | `promotions.edit` | `PATCH /api/promotions/{promotionId}` and `PATCH /api/gifts/{id}` |
 | `promotions.delete` | `DELETE /api/gifts/{id}` |
 | `claims.view` | Claim list, search, and view endpoints |
 | `claims.export` | Claim fulfilment endpoints |
-| `claims.edit` | `PATCH /api/claims/{claimId}` |
+| `claims.edit` | `PATCH /api/claims/{claimId}` and `POST /api/claims/{claimId}/confirmation-email` |
 | `claims.delete` | `DELETE /api/claims/{claimId}` |
 
 The permission code must exist in `permissions` with `status = 1`, and the Account's active Role must be connected to it through `role_permissions`. A Super Admin must also have these mappings; the Role name alone does not bypass permission checks.
@@ -507,6 +508,89 @@ Unknown IMEI response: `404 Not Found`
 
 Database or configuration failure response: `503 Service Unavailable`
 
+### Create Event
+
+```http
+POST /api/events
+Content-Type: multipart/form-data
+```
+
+Requires a valid Bearer access token and the `events.create` permission. Creates the Event and all supplied configuration in one database transaction. It does not create Event Claims, Customers, addresses, scratch codes, or tracking records.
+
+Multipart parts:
+
+| Part | Required | Description |
+| --- | --- | --- |
+| `data` | Yes | JSON object text matching the example below. |
+| `banner` | Yes | One non-empty JPG, JPEG, PNG, WEBP, or GIF image. |
+| `terms` | Yes | Either the exact text `/terms` or one non-empty PDF, JPG, JPEG, or PNG file. Do not send both. |
+
+Example `data` value:
+
+```json
+{
+  "name": "OPPO Experience Event",
+  "startDate": "2026-11-01",
+  "endDate": "2026-11-30",
+  "requiresImei": true,
+  "requiresChannel": true,
+  "requiresDelivery": false,
+  "models": ["CPH2831"],
+  "channelCodes": ["SPK"],
+  "sections": [
+    {
+      "title": "Purchase Details",
+      "sortOrder": 1,
+      "fields": [
+        {
+          "key": "purchase_location",
+          "label": "Purchase Location",
+          "type": "select",
+          "placeholder": "Select a location",
+          "required": true,
+          "sortOrder": 1,
+          "validation": null,
+          "options": [
+            { "value": "spark", "label": "Spark", "sortOrder": 1 }
+          ]
+        }
+      ]
+    }
+  ],
+  "uploads": [
+    { "key": "receipt", "label": "Upload Receipt" }
+  ]
+}
+```
+
+Rules and storage:
+
+- `name`, `startDate`, and `endDate` are required. Name is trimmed and limited to 255 characters. Dates use `yyyy-MM-dd`; start time becomes `00:00:00`, end time becomes `23:59:59`. End cannot precede start. These are Event local calendar values consistent with the list endpoint's Pacific/Auckland comparison.
+- `requiresImei` and `requiresChannel` default to `true`; `requiresDelivery` defaults to `false`.
+- `models`, `channelCodes`, `sections`, and `uploads` default to empty arrays when omitted; explicit `null` is rejected. `channelCodes` must be non-empty when `requiresChannel` is true.
+- Models and Channel codes are trimmed, uppercased, and deduplicated. Every model must exist in `Devices.model`; every code must exist in `Channels.code`. Invalid references reject the whole request. Event model and Channel eligibility lists are validated independently.
+- `Event_Channels` and `Event_Models` link to the generated Event ID. Event dates are stored on `Events`, not on each Channel.
+- Sections link to the generated Event ID; fields link to generated Section IDs; options link to generated Field IDs. Section `fields` and field `options` can be omitted or null to mean empty lists. Null array elements are rejected.
+- Section title and field placeholder are optional and limited to 255 characters. Field `key` (100), `label` (255), and `type` (50) are required. Keys are unique across all fields and uploads within an Event, ignoring case. Field type is stored as supplied and must match the frontend renderer's supported types.
+- Field `validation` is an optional JSON object stored in `validation_json`; this endpoint stores configuration, not customer answers. `required` defaults to false and `sortOrder` defaults to zero.
+- Option `value` and `label` are required, limited to 255 characters, and option values must be unique within a field. Upload `key` (100) and `label` (255) are required. Upload rows define future form file inputs; they do not contain uploaded Claim files.
+- Banner and custom Terms files are UUID-renamed. Banner is uploaded to `banners/Events/imgs/`, and only the filename is stored in `Events.banner_url`. Custom Terms is uploaded to `terms/Events/`, and its public URL is stored in `Events.terms_url`; text Terms stores `/terms`.
+- Each file must fit `R2_UPLOAD_MAX_BYTES`. Existing HTTP server multipart size limits also apply.
+- A unique slug without a leading route prefix is generated from the name and a UUID suffix. No Event ID, Section ID, or Field ID is required from the client.
+- A database failure rolls back all inserted records and attempts to remove files uploaded by this request. Event name/date duplicates are not rejected by a business duplicate detector.
+
+Success: `201 Created`
+
+```json
+{
+  "success": true,
+  "eventId": 12,
+  "slugUrl": "oppo-experience-event-550e8400e29b41d4a716446655440000"
+}
+```
+
+Status codes: `400` for invalid fields, JSON, references, or file validation; `401` for missing/invalid login; `403` for missing `events.create`; `415` for a non-multipart request; `503` for database, R2, or configuration failures. Application errors contain an `error` string. No Event date or status filter is applied during creation.
+
 ### List Events
 
 ```http
@@ -822,6 +906,46 @@ Success response: `200 OK`
 - Non-multipart request: `415 Unsupported Media Type`
 - Database or R2 failure: `503 Service Unavailable`
 
+### Manually Send Claim Confirmation Email
+
+```http
+POST /api/claims/{claimId}/confirmation-email
+Content-Type: application/json
+```
+
+Requires a valid Bearer access token and `claims.edit`. The route identifies an existing `Claims.id`; no new Claim ID or Claim is created. This endpoint sends immediately using the same text and HTML confirmation template used after Claim creation.
+
+All request fields are required:
+
+```json
+{
+  "name": "Chris Example",
+  "email": "customer@example.com",
+  "gift": "OPPO Watch Black",
+  "address": "1 Example Street, Newmarket, Auckland 1023"
+}
+```
+
+`name` is the customer's full display name, `gift` is the gift display text (multiple gifts can be combined into one string), and `address` is the complete delivery address. Text is trimmed and validated using the shared printable ASCII rules. Email format is validated. These values populate the email only and do not update Customer, Gift, or address records. No status or date filter is applied to the Claim lookup. An email can be resent even if its previous `email_status` was `1`.
+
+After SMTP submission succeeds, `Claims.email_status` is set to `1` and `Claims.updated_at` is updated. A failed manual attempt does not clear a previously recorded email status. SMTP acceptance does not guarantee inbox delivery.
+
+Success: `200 OK`
+
+```json
+{
+  "success": true,
+  "claimId": "OPNZPROCLM-260903-4EUZB66Y",
+  "emailStatus": 1
+}
+```
+
+- Invalid or missing input: `400 Bad Request` with `{ "success": false, "error": "..." }`.
+- Missing or invalid login: `401 Unauthorized`.
+- Missing `claims.edit`: `403 Forbidden`.
+- Claim not found: `404 Not Found` with `{ "success": false, "error": "Claim was not found." }`.
+- Database, email configuration, SMTP, or status-recording failure: `503 Service Unavailable` with `{ "success": false, "error": "..." }`. If SMTP succeeds but recording the status fails, the email may already have been sent.
+
 ### Get Claims
 
 ```http
@@ -968,6 +1092,7 @@ Response rules:
 - `claimId` comes from `Claims.id`.
 - `marketName` comes from `Devices.market_name`, matched by `Claims.imei = Devices.imei`. If no matching Device exists or its market name is `NULL`, the value is `null`; the Claim is still returned.
 - `email` and `contact` come from the related `Customers` row.
+- `emailStatus` comes from `Claims.email_status` and is returned as a number; a database `NULL` returns `null`.
 - `street`, `suburb`, `city`, `postcode`, and `instructions` come from the latest current `Deliver_Addresses` row. Missing or database `NULL` values are returned as empty strings. `fullAddress` is also retained as the combined display value.
 - `giftAliases` contains every related `Gifts.alias` found through `Claim_Gifts`; no Gift returns an empty array.
 - `receiptUrl` and `imeiCopyUrl` use the filenames from `Claims.receipt_url` and `Claims.screenshot_url`. The backend obtains `Claims.promotion_id` and searches Cloudflare R2 with the prefix `claims/promotions/{promotionId}/{partial-file-name}`. A unique match is returned with its complete UUID filename and extension. Both lookups run concurrently.
@@ -996,6 +1121,7 @@ Success response: `200 OK`
   "giftAliases": ["ENCO BUDS3PRO WHITE"],
   "receiptUrl": "https://assets.example.com/claims/promotions/123/receipt-uuid.jpg",
   "receiptSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "emailStatus": 1,
   "imeiCopyUrl": "https://assets.example.com/claims/promotions/123/imei-copy-uuid.png",
   "imeiCopySha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "reference": "DELIVERY-REFERENCE-123",

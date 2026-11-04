@@ -6,6 +6,7 @@ internal static class PermissionCodes
     public const string AccountsCreate = "accounts.create";
     public const string RolesView = "roles.view";
     public const string EventsView = "events.view";
+    public const string EventsCreate = "events.create";
     public const string ClaimsView = "claims.view";
     public const string ClaimsEdit = "claims.edit";
     public const string ClaimsDelete = "claims.delete";
@@ -24,6 +25,7 @@ internal static class PermissionCodes
         AccountsCreate,
         RolesView,
         EventsView,
+        EventsCreate,
         ClaimsView,
         ClaimsEdit,
         ClaimsDelete,
