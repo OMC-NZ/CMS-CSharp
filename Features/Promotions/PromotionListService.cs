@@ -52,7 +52,7 @@ internal sealed partial class PromotionListService(IConfiguration configuration)
               AND LOWER(TRIM(d.market_name)) <> 'temp'
             ORDER BY pd.promotion_id DESC, d.market_name;
 
-            SELECT DISTINCT pg.promotion_id, g.id, g.name, g.color, g.alias
+            SELECT DISTINCT pg.promotion_id, g.id, g.name, g.color, g.alias, pg.gift_comb
             FROM Promotion_Gifts pg
             INNER JOIN Gifts g ON g.id = pg.gift_id
             INNER JOIN (
@@ -108,8 +108,9 @@ internal sealed partial class PromotionListService(IConfiguration configuration)
                             ? name
                             : $"{name} {color}";
                     item.Gifts.TryAdd(
-                        reader.GetString(4),
-                        new PromotionGiftListItem(displayName, reader.GetString(4)));
+                        (reader.GetInt32(5), reader.GetString(4)),
+                        new PromotionGiftListItem(displayName, reader.GetString(4), reader.GetInt32(5),
+                            reader.GetInt32(1), color, name));
                 }
             }
         }
@@ -123,7 +124,8 @@ internal sealed partial class PromotionListService(IConfiguration configuration)
                 item.ChannelCategories.Order(StringComparer.OrdinalIgnoreCase).ToArray(),
                 item.MarketNames.Order(StringComparer.OrdinalIgnoreCase).ToArray(),
                 item.Gifts.Values
-                    .OrderBy(gift => gift.Name, StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(gift => gift.GiftComb)
+                    .ThenBy(gift => gift.Name, StringComparer.OrdinalIgnoreCase)
                     .ThenBy(gift => gift.Alias, StringComparer.OrdinalIgnoreCase)
                     .ToArray()))
             .ToArray();
@@ -163,8 +165,7 @@ internal sealed partial class PromotionListService(IConfiguration configuration)
         public string BannerUrl { get; } = bannerUrl;
         public HashSet<string> ChannelCategories { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<string> MarketNames { get; } = new(StringComparer.OrdinalIgnoreCase);
-        public Dictionary<string, PromotionGiftListItem> Gifts { get; } =
-            new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<(int Combo, string Alias), PromotionGiftListItem> Gifts { get; } = new();
     }
 }
 
@@ -174,8 +175,18 @@ internal sealed record PromotionListItem(
     string BannerUrl,
     IReadOnlyList<string> ChannelCategories,
     IReadOnlyList<string> MarketNames,
-    IReadOnlyList<PromotionGiftListItem> Gifts);
+    IReadOnlyList<PromotionGiftListItem> Gifts)
+{
+    public IReadOnlyList<PromotionGiftComboResult> GiftCombos => Gifts.GroupBy(gift => gift.GiftComb)
+        .OrderBy(group => group.Key)
+        .Select(group => new PromotionGiftComboResult(group.Key, group.Select(gift =>
+            new PromotionComboGiftResult(gift.Id, gift.RawName, gift.Alias, gift.Color)).ToArray())).ToArray();
+}
 
 internal sealed record PromotionGiftListItem(
     string Name,
-    string Alias);
+    string Alias,
+    [property: System.Text.Json.Serialization.JsonPropertyName("gift_comb")] int GiftComb,
+    [property: System.Text.Json.Serialization.JsonIgnore] int Id,
+    [property: System.Text.Json.Serialization.JsonIgnore] string? Color,
+    [property: System.Text.Json.Serialization.JsonIgnore] string RawName);

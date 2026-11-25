@@ -178,6 +178,7 @@ internal sealed partial class PromotionCreationService(
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
             var giftIds = new List<int>();
+            var giftSelections = new List<PromotionGiftSelection>();
             var giftIdsByAlias = await referenceData.FindGiftIdsByAliasesAsync(
                 connection, transaction, gifts, cancellationToken);
             foreach (var giftAlias in gifts)
@@ -191,12 +192,16 @@ internal sealed partial class PromotionCreationService(
                 giftIds.Add(giftId);
             }
 
+            foreach (var gift in request.Gifts)
+                giftSelections.Add(new PromotionGiftSelection(giftIdsByAlias[gift.Alias.Trim()], gift.GiftComb));
+            giftSelections = giftSelections.Distinct().ToList();
+
             var comparisonData = new PromotionComparisonData(
                 validModels.Order(StringComparer.OrdinalIgnoreCase).ToArray(),
                 effectiveChannels
                     .OrderBy(channel => channel.Code, StringComparer.OrdinalIgnoreCase)
                     .ToArray(),
-                giftIds.Distinct().Order().ToArray());
+                giftIds.Distinct().Order().ToArray(), giftSelections);
             var conflict = await conflictDetector.FindConflictAsync(
                 connection,
                 transaction,
@@ -267,18 +272,19 @@ internal sealed partial class PromotionCreationService(
                     ("@updatedAt", updatedAt));
             }
 
-            foreach (var giftId in giftIds.Distinct())
+            foreach (var gift in giftSelections)
             {
                 await ExecuteAsync(
                     connection,
                     transaction,
                     """
-                    INSERT INTO Promotion_Gifts (promotion_id, gift_id)
-                    VALUES (@promotionId, @giftId);
+                    INSERT INTO Promotion_Gifts (promotion_id, gift_id, gift_comb)
+                    VALUES (@promotionId, @giftId, @giftComb);
                     """,
                     cancellationToken,
                     ("@promotionId", promotionId),
-                    ("@giftId", giftId));
+                    ("@giftId", gift.GiftId),
+                    ("@giftComb", gift.GiftComb));
             }
 
             await transaction.CommitAsync(cancellationToken);
@@ -361,10 +367,13 @@ internal sealed partial class PromotionCreationService(
             throw new PromotionValidationException("At least one gift is required.");
         }
 
-        if (request.Gifts.Any(gift => string.IsNullOrWhiteSpace(gift.Alias)))
+        if (request.Gifts.Any(gift => gift is null || string.IsNullOrWhiteSpace(gift.Alias)))
         {
             throw new PromotionValidationException("Every gift must include alias.");
         }
+
+        if (request.Gifts.Any(gift => gift.GiftComb < 1))
+            throw new PromotionValidationException("gift_comb must be a positive integer.");
 
         if (request.Banner.Length == 0 ||
             !request.Banner.ContentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))

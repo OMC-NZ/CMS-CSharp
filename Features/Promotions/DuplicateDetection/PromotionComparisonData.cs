@@ -8,7 +8,8 @@ internal sealed record PromotionChannelPeriod(
 internal sealed record PromotionComparisonData(
     IReadOnlyList<string> Models,
     IReadOnlyList<PromotionChannelPeriod> Channels,
-    IReadOnlyList<int> GiftIds);
+    IReadOnlyList<int> GiftIds,
+    IReadOnlyList<PromotionGiftSelection>? GiftSelections = null);
 
 internal sealed record PromotionConflict(
     long PromotionId,

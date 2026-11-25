@@ -199,7 +199,7 @@ internal sealed partial class PromotionUpdateService(
                     effectiveChannels
                         .OrderBy(channel => channel.Code, StringComparer.OrdinalIgnoreCase)
                         .ToArray(),
-                    giftIds.Distinct().Order().ToArray());
+                    giftIds.Select(gift => gift.GiftId).Distinct().Order().ToArray(), giftIds);
                 var conflict = await conflictDetector.FindConflictAsync(
                     connection,
                     transaction,
@@ -297,7 +297,7 @@ internal sealed partial class PromotionUpdateService(
                     skippedProducts,
                     effectiveChannels.Count,
                     skippedChannels,
-                    giftIds.Distinct().Count()),
+                    giftIds.Select(gift => gift.GiftId).Distinct().Count()),
                 newBannerFileName is null ? null : current.BannerUrl,
                 (termsAction is PromotionTermsAction.Upload or PromotionTermsAction.Delete) &&
                 !string.Equals(current.TermsUrl, "/terms", StringComparison.OrdinalIgnoreCase)
@@ -357,22 +357,24 @@ internal sealed partial class PromotionUpdateService(
             skippedMissingChannels + validSubmittedChannels.Length - effectiveChannels.Length);
     }
 
-    private async Task<IReadOnlyList<int>> ResolveGiftIdsAsync(
+    private async Task<IReadOnlyList<PromotionGiftSelection>> ResolveGiftIdsAsync(
         MySqlConnection connection,
         MySqlTransaction transaction,
         IReadOnlyList<PromotionGiftInput> gifts,
         CancellationToken cancellationToken)
     {
-        if (gifts.Any(gift => string.IsNullOrWhiteSpace(gift.Alias)))
+        if (gifts.Any(gift => gift is null || string.IsNullOrWhiteSpace(gift.Alias)))
         {
             throw new PromotionValidationException("Every gift must include alias.");
         }
+        if (gifts.Any(gift => gift.GiftComb < 1))
+            throw new PromotionValidationException("gift_comb must be a positive integer.");
         var aliases = gifts.Select(gift => gift.Alias.Trim())
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
         var idsByAlias = await referenceData.FindGiftIdsByAliasesAsync(
             connection, transaction, aliases, cancellationToken);
-        var ids = new List<int>();
+        var ids = new List<PromotionGiftSelection>();
         foreach (var alias in aliases)
         {
             if (!idsByAlias.TryGetValue(alias, out var id))
@@ -380,9 +382,10 @@ internal sealed partial class PromotionUpdateService(
                 throw new PromotionValidationException(
                     $"Gift alias '{alias}' does not exist.");
             }
-            ids.Add(id);
+            foreach (var gift in gifts.Where(gift => gift.Alias.Trim().Equals(alias, StringComparison.OrdinalIgnoreCase)))
+                ids.Add(new PromotionGiftSelection(id, gift.GiftComb));
         }
-        return ids;
+        return ids.Distinct().ToArray();
     }
 
     private static IReadOnlyList<string> NormalizeModels(
@@ -488,20 +491,21 @@ internal sealed partial class PromotionUpdateService(
         return result;
     }
 
-    private static async Task<IReadOnlyList<int>> LoadGiftIdsAsync(
+    private static async Task<IReadOnlyList<PromotionGiftSelection>> LoadGiftIdsAsync(
         MySqlConnection connection,
         MySqlTransaction transaction,
         int promotionId,
         CancellationToken cancellationToken)
     {
         await using var command = new MySqlCommand(
-            "SELECT gift_id FROM Promotion_Gifts WHERE promotion_id = @promotionId;",
+            "SELECT gift_id, gift_comb FROM Promotion_Gifts WHERE promotion_id = @promotionId;",
             connection,
             transaction);
         command.Parameters.AddWithValue("@promotionId", promotionId);
-        var result = new List<int>();
+        var result = new List<PromotionGiftSelection>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken)) result.Add(reader.GetInt32(0));
+        while (await reader.ReadAsync(cancellationToken))
+            result.Add(new PromotionGiftSelection(reader.GetInt32(0), reader.GetInt32(1)));
         return result;
     }
 
@@ -550,17 +554,17 @@ internal sealed partial class PromotionUpdateService(
         MySqlConnection connection,
         MySqlTransaction transaction,
         int promotionId,
-        IReadOnlyList<int> giftIds,
+        IReadOnlyList<PromotionGiftSelection> giftIds,
         CancellationToken cancellationToken)
     {
         await ExecuteAsync(connection, transaction,
             "DELETE FROM Promotion_Gifts WHERE promotion_id = @promotionId;",
             cancellationToken, ("@promotionId", promotionId));
-        foreach (var giftId in giftIds.Distinct())
+        foreach (var gift in giftIds.Distinct())
         {
             await ExecuteAsync(connection, transaction,
-                "INSERT INTO Promotion_Gifts (promotion_id, gift_id) VALUES (@promotionId, @giftId);",
-                cancellationToken, ("@promotionId", promotionId), ("@giftId", giftId));
+                "INSERT INTO Promotion_Gifts (promotion_id, gift_id, gift_comb) VALUES (@promotionId, @giftId, @giftComb);",
+                cancellationToken, ("@promotionId", promotionId), ("@giftId", gift.GiftId), ("@giftComb", gift.GiftComb));
         }
     }
 

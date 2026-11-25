@@ -25,8 +25,30 @@ internal sealed class PromotionConflictDetector
             incoming.Channels,
             cancellationToken);
 
+        var giftSignatures = new Dictionary<long, List<PromotionGiftSelection>>();
+        if (candidates.Count > 0)
+        {
+            var names = CreateParameterNames("comboPromotion", candidates.Count);
+            await using var command = new MySqlCommand(
+                $"SELECT promotion_id, gift_id, gift_comb FROM Promotion_Gifts WHERE promotion_id IN ({string.Join(',', names)});",
+                connection, transaction);
+            AddParameters(command, names, candidates.Select(x => (object)x.PromotionId).ToArray());
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var id = reader.GetInt64(0);
+                if (!giftSignatures.TryGetValue(id, out var gifts))
+                    giftSignatures[id] = gifts = [];
+                gifts.Add(new PromotionGiftSelection(reader.GetInt32(1), reader.GetInt32(2)));
+            }
+        }
+        var incomingSignature = ComboSignature(incoming.GiftSelections ??
+            incoming.GiftIds.Select(id => new PromotionGiftSelection(id, 1)).ToArray());
+
         foreach (var candidate in candidates)
         {
+            if (ComboSignature(giftSignatures.GetValueOrDefault(candidate.PromotionId) ?? []) != incomingSignature)
+                continue;
             if (overlapsByPromotion.TryGetValue(candidate.PromotionId, out var overlappingCodes) &&
                 overlappingCodes.Count > 0)
             {
@@ -40,6 +62,11 @@ internal sealed class PromotionConflictDetector
 
         return null;
     }
+
+    private static string ComboSignature(IEnumerable<PromotionGiftSelection> gifts) =>
+        string.Join("|", gifts.GroupBy(gift => gift.GiftComb)
+            .Select(group => string.Join(',', group.Select(gift => gift.GiftId).Distinct().Order()))
+            .Distinct().Order(StringComparer.Ordinal));
 
     private static async Task<IReadOnlyList<PromotionCandidate>> FindCandidatesWithEqualSetsAsync(
         MySqlConnection connection,

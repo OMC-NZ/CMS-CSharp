@@ -111,6 +111,14 @@ internal sealed partial class EligiblePromotionLookupService(IConfiguration conf
             }
         }
 
+        await reader.DisposeAsync();
+        var combos = await PromotionGiftCombos.LoadAsync(
+            connection, promotions.Select(promotion => promotion.Id).Distinct().ToArray(), cancellationToken);
+        promotions = promotions.Select(promotion => promotion with
+        {
+            GiftCombos = combos.GetValueOrDefault(promotion.Id) ?? []
+        }).ToList();
+
         return new EligiblePromotionsResult(
             normalizedImei,
             claimIds,
@@ -167,4 +175,7 @@ internal sealed record EligiblePromotionResult(
     string ChannelName,
     string StartDate,
     string EndDate,
-    string RedeemEndDate);
+    string RedeemEndDate)
+{
+    public IReadOnlyList<PromotionGiftComboResult> GiftCombos { get; init; } = [];
+}

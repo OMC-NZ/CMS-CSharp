@@ -85,13 +85,16 @@ internal sealed partial class PromotionDetailsService(IConfiguration configurati
             }
         }
 
+        await reader.DisposeAsync();
+        var combos = await PromotionGiftCombos.LoadAsync(connection, [promotionId], cancellationToken);
         return new PromotionDetailsResult(
             promotionId,
             description,
             slugUrl,
             termsUrl,
             channels,
-            devices);
+            devices,
+            combos.GetValueOrDefault(promotionId) ?? []);
     }
 
     private static string NormalizeMySqlConnectionString(string connectionString)
@@ -117,7 +120,8 @@ internal sealed record PromotionDetailsResult(
     string SlugUrl,
     string TermsUrl,
     IReadOnlyList<PromotionDetailsChannel> Channels,
-    IReadOnlyList<PromotionDetailsDevice> Devices);
+    IReadOnlyList<PromotionDetailsDevice> Devices,
+    IReadOnlyList<PromotionGiftComboResult> GiftCombos);
 
 internal sealed record PromotionDetailsChannel(
     string Name,

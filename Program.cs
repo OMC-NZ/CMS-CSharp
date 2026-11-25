@@ -1178,7 +1178,7 @@ app.MapPost("/api/promotions", async (
             form["description"].ToString(),
             DeserializeRequiredList<PromotionProductInput>(form, "products"),
             DeserializeRequiredList<PromotionChannelInput>(form, "channels"),
-            DeserializeRequiredList<PromotionGiftInput>(form, "gifts"),
+            ReadPromotionGifts(form, required: true)!,
             form["terms"].FirstOrDefault(),
             form.Files.GetFile("terms"),
             banner);
@@ -1248,7 +1248,7 @@ app.MapPatch("/api/promotions/{promotionId:int}", async (
             GetOptionalFormValue(form, "description"),
             DeserializeOptionalPromotionList<PromotionProductInput>(form, "products"),
             DeserializeOptionalPromotionList<PromotionChannelInput>(form, "channels"),
-            DeserializeOptionalPromotionList<PromotionGiftInput>(form, "gifts"),
+            ReadPromotionGifts(form, required: false),
             GetOptionalFormValue(form, "termsAction"),
             form.Files.GetFile("terms"),
             form.Files.GetFile("banner"));
@@ -1872,6 +1872,32 @@ static IReadOnlyList<T>? DeserializeOptionalPromotionList<T>(
 
 static string? GetOptionalFormValue(IFormCollection form, string fieldName) =>
     form.ContainsKey(fieldName) ? form[fieldName].ToString() : null;
+
+static IReadOnlyList<PromotionGiftInput>? ReadPromotionGifts(IFormCollection form, bool required)
+{
+    if (!form.ContainsKey("giftCombos"))
+        return required ? DeserializeRequiredList<PromotionGiftInput>(form, "gifts")
+            : DeserializeOptionalPromotionList<PromotionGiftInput>(form, "gifts");
+    if (form.ContainsKey("gifts"))
+        throw new PromotionValidationException("Provide either giftCombos or gifts, not both.");
+    var combos = DeserializeRequiredList<PromotionGiftComboInput>(form, "giftCombos");
+    var numbers = new HashSet<int>();
+    var gifts = new List<PromotionGiftInput>();
+    foreach (var combo in combos)
+    {
+        if (combo is null || combo.GiftComb < 1 || !numbers.Add(combo.GiftComb))
+            throw new PromotionValidationException("Each giftCombos entry requires a unique positive gift_comb.");
+        if (combo.Gifts is not { Count: > 0 })
+            throw new PromotionValidationException("Each gift combination must contain at least one Gift.");
+        foreach (var gift in combo.Gifts)
+        {
+            if (gift is null || string.IsNullOrWhiteSpace(gift.Alias))
+                throw new PromotionValidationException("Every Gift must include alias.");
+            gifts.Add(new PromotionGiftInput(gift.Alias, combo.GiftComb));
+        }
+    }
+    return gifts;
+}
 
 static string NormalizeMySqlConnectionString(string connectionString)
 {

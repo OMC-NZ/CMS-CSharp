@@ -56,7 +56,6 @@ internal sealed partial class ClaimCreationService(
             var giftIds = await ResolveGiftIdsAsync(
                 connection,
                 null,
-                request.PromotionId,
                 request.GiftAliases,
                 cancellationToken);
             var claimId = await CreateUniqueClaimIdAsync(
@@ -214,7 +213,6 @@ internal sealed partial class ClaimCreationService(
     private async Task<IReadOnlyList<int>> ResolveGiftIdsAsync(
         MySqlConnection connection,
         MySqlTransaction? transaction,
-        int promotionId,
         IReadOnlyList<string> giftAliases,
         CancellationToken cancellationToken)
     {
@@ -230,31 +228,24 @@ internal sealed partial class ClaimCreationService(
             $"""
             SELECT
                 g.alias,
-                g.id,
-                EXISTS(
-                    SELECT 1
-                    FROM Promotion_Gifts pg
-                    WHERE pg.promotion_id = @promotionId
-                      AND pg.gift_id = g.id
-                ) OR @promotionId = 0 AS is_available
+                g.id
             FROM Gifts g
             WHERE g.alias IN ({string.Join(", ", aliasParameters)});
             """,
             connection,
             transaction);
-        command.Parameters.AddWithValue("@promotionId", promotionId);
         for (var index = 0; index < aliases.Length; index++)
         {
             command.Parameters.AddWithValue(aliasParameters[index], aliases[index]);
         }
 
-        var resolved = new Dictionary<string, (int Id, bool IsAvailable)>(
+        var resolved = new Dictionary<string, int>(
             StringComparer.OrdinalIgnoreCase);
         await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
         {
             while (await reader.ReadAsync(cancellationToken))
             {
-                resolved[reader.GetString(0)] = (reader.GetInt32(1), reader.GetBoolean(2));
+                resolved[reader.GetString(0)] = reader.GetInt32(1);
             }
         }
 
@@ -266,13 +257,7 @@ internal sealed partial class ClaimCreationService(
                 throw new ClaimValidationException($"Gift alias '{alias}' does not exist.");
             }
 
-            if (!gift.IsAvailable)
-            {
-                throw new ClaimValidationException(
-                    $"Gift alias '{alias}' is not available for the selected promotion.");
-            }
-
-            giftIds.Add(gift.Id);
+            giftIds.Add(gift);
         }
 
         return giftIds;

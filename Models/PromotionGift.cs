@@ -11,4 +11,7 @@ public class PromotionGift
 
     [Column("gift_id")]
     public int GiftId { get; set; }
+
+    [Column("gift_comb"), Range(1, int.MaxValue)]
+    public int GiftComb { get; set; } = 1;
 }

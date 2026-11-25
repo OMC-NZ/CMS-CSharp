@@ -637,7 +637,7 @@ Data and aggregation rules:
 - `bannerUrl` is a complete clickable URL under `{R2_PUBLIC_ASSETS_URL}/banners/Promotions/{banner-file}`. An already absolute database URL is returned unchanged; the API does not proxy the image binary.
 - `channelCategories` contains distinct `Channels.category` values joined through `Promotion_Channels.channel_code = Channels.code`. Ten Channels with the same Category therefore return that Category only once.
 - `marketNames` contains distinct `Devices.market_name` values joined through `Promotion_Devices.eligible_model = Devices.model`. Empty values and `temp` are excluded after trimming and case-insensitive comparison.
-- `gifts` contains objects joined through `Promotion_Gifts` and `Gifts`. Each object's `name` is the display value `Gifts.name + " " + Gifts.color`; when color is empty or equals `Empty` case-insensitively, it contains only `Gifts.name`. The object's `alias` comes from the unique `Gifts.alias` and can be sent back by an edit form.
+- `gifts` contains objects joined through `Promotion_Gifts` and `Gifts`. Each object's `name` is the display value `Gifts.name + " " + Gifts.color`; when color is empty or equals `Empty` case-insensitively, it contains only `Gifts.name`. The object's `alias` comes from `Gifts.alias`, and `gift_comb` comes from `Promotion_Gifts.gift_comb`. Items are grouped by combination number, then sorted by name and alias. The same Gift is returned separately when it belongs to different combinations.
 - Related values are returned as arrays and are empty when the Promotion has no matching rows. All relationship queries are limited to the same latest 15 Promotion IDs, and the separate queries avoid multiplication caused by joining several many-to-many relationships together.
 
 Success response: `200 OK`
@@ -716,6 +716,83 @@ Unknown Promotion response: `404 Not Found`
 
 Database, configuration, or connection failure response: `503 Service Unavailable`
 
+### Promotion Gift Combinations
+
+`Promotion_Gifts.gift_comb` is a positive integer, default `1`. Within a combination all Gifts apply together (AND); different combinations are alternatives (OR). `Gifts` continues to store individual items.
+
+Recommended multipart input for `POST /api/promotions` and `PATCH /api/promotions/{promotionId}`:
+
+```json
+giftCombos = [
+  {
+    "gift_comb": 1,
+    "gifts": [{"alias":"WATCH BLACK"},{"alias":"BUDS WHITE"}]
+  },
+  {
+    "gift_comb": 2,
+    "gifts": [{"alias":"WATCH SILVER"}]
+  }
+]
+```
+
+Each group requires a unique positive `gift_comb` and a non-empty `gifts` array of existing aliases. Put `gift_comb` on the outer group; child objects need only `alias`. Do not submit both `giftCombos` and the legacy `gifts` field: this returns `400`. Existing clients may continue submitting the flat `gifts` array with optional `gift_comb` (default `1`). Creation requires at least one Gift. For PATCH, omit both fields to keep all combinations, or send `giftCombos: []` to remove all of them; otherwise send the entire final combination list.
+
+Frontend creation example (the API prefix below is the server origin, without `/api`):
+
+```ts
+const formData = new FormData();
+formData.append("name", promotionName);
+formData.append("description", description);
+formData.append("products", JSON.stringify([{ model: "CPH2831" }]));
+formData.append("channels", JSON.stringify([
+  { code: "SPK", startDate: "2026-11-01", endDate: "2026-11-30" }
+]));
+formData.append("giftCombos", JSON.stringify([
+  { gift_comb: 1, gifts: [{ alias: "WATCH BLACK" }, { alias: "BUDS WHITE" }] },
+  { gift_comb: 2, gifts: [{ alias: "WATCH SILVER" }] }
+]));
+formData.append("banner", bannerFile);
+formData.append("terms", termsFile ?? "/terms");
+
+const response = await fetch(`${API_PREFIX}/api/promotions`, {
+  method: "POST",
+  headers: { Authorization: `Bearer ${accessToken}` },
+  body: formData
+});
+const result = await response.json();
+if (!response.ok) throw new Error(result.error ?? "Unable to create promotion.");
+```
+
+If `API_PREFIX` already ends with `/api`, append `/promotions` instead. Do not set the multipart Content-Type manually. `market_name` is not required in products. A banner file remains required; the frontend may supply a default image file when no custom image is selected.
+
+`GET /api/promotions`, `GET /api/promotions/{promotionId}`, and every Promotion returned by `GET /api/promotions/eligible?imei=...` include `giftCombos`:
+
+```json
+{
+  "giftCombos": [
+    {
+      "gift_comb": 1,
+      "gifts": [
+        {"id":10,"name":"OPPO Watch","alias":"WATCH BLACK","color":"Black"},
+        {"id":11,"name":"OPPO Buds","alias":"BUDS WHITE","color":"White"}
+      ]
+    },
+    {
+      "gift_comb": 2,
+      "gifts": [
+        {"id":12,"name":"OPPO Watch","alias":"WATCH SILVER","color":"Silver"}
+      ]
+    }
+  ]
+}
+```
+
+Groups are ordered by `gift_comb`; no groups returns `[]`. Existing response fields are retained, including the flat `gifts` summary in the Promotion list. Use `giftCombos` to render selectable packages. Promotion list date/row limits and eligible-Promotion filtering remain as documented for those endpoints. These additive response changes introduce no new inputs or status codes for GET requests.
+
+`POST /api/claims` accepts `giftAliases` and checks only that each alias exists in `Gifts`; it does not require membership in the selected Promotion. `PATCH /api/claims/{claimId}` still checks Gift membership for normal Promotions, with the existing `promotionId = 0` exemption. Neither endpoint checks `gift_comb`, package completeness, or cross-package selections. Existing Claim history, Claim GET responses, exports, and confirmation emails continue to use the actual Gifts recorded in `Claim_Gifts`, not all available Promotion combinations.
+
+Gift deletion continues to return `409` if the Gift appears in any Promotion combination or Claim. Changing combination numbers alone does not bypass Promotion duplicate detection, which compares package contents rather than the label numbers.
+
 ### Create Promotion
 
 ```http
@@ -735,7 +812,8 @@ Multipart form fields:
 | `description` | Text | Yes | Promotion description. |
 | `products` | JSON array text | Yes | Devices selected by `model`. |
 | `channels` | JSON array text | Yes | Channels selected by unique `code`; `startDate` and `endDate` use `yyyy-MM-dd` without a time component. |
-| `gifts` | JSON array text | Yes | Existing Gifts selected by unique `alias`. |
+| `giftCombos` | JSON array text | Conditional | Recommended Gift package structure shown above. Supply this or legacy `gifts`. |
+| `gifts` | JSON array text | Conditional | Legacy existing Gifts selected by unique `alias`, with optional positive integer `gift_comb` (default `1`). |
 | `banner` | File | Yes | Non-empty image file. |
 | `terms` | Text or file | Yes | Either the exact text `/terms` or one uploaded terms file, but not both. |
 
@@ -779,7 +857,7 @@ Storage and database behavior:
 - A product is matched only by its unique `model`. The Devices table must contain that model with at least one submitted, valid channel code. Otherwise the model is skipped and is not inserted into `Promotion_Devices.eligible_model`.
 - A valid submitted channel is inserted into `Promotion_Channels` only when at least one accepted device model is associated with that channel in the Devices table.
 - Gifts are matched only by unique `alias`; an unknown alias rejects the request with `400 Bad Request`.
-- A conflict exists when an existing promotion has exactly the same effective model set, channel-code set, and gift-ID set, and at least one matching channel period overlaps inclusively. Periods overlap when `newStart <= existingEnd` and `newEnd >= existingStart`. An end date followed by the next calendar day's start date is allowed; using the same calendar date is an overlap.
+- A conflict exists when an existing promotion has exactly the same effective model set, channel-code set, and Gift combination structure, and at least one matching channel period overlaps inclusively. Combination numbers are labels: renumbering identical packages does not bypass conflict detection. Periods overlap when `newStart <= existingEnd` and `newEnd >= existingStart`. An end date followed by the next calendar day's start date is allowed; using the same calendar date is an overlap.
 - Valid related rows are inserted into `Promotion_Devices`, `Promotion_Channels`, and `Promotion_Gifts`.
 - If database work fails, the transaction is rolled back and files uploaded by the request are removed from R2.
 
@@ -839,7 +917,8 @@ Multipart form fields:
 | `description` | Text | No | Replaces `Promotions.description`. An empty supplied value is rejected. |
 | `products` | JSON array text | No | Final complete Device model list. Omission keeps the current list; `[]` removes every model. |
 | `channels` | JSON array text | No | Final complete Channel and period list. Omission keeps the current list; `[]` removes every Channel period. |
-| `gifts` | JSON array text | No | Final complete Gift alias list. Omission keeps the current list; `[]` removes every Gift. |
+| `gifts` | JSON array text | No | Final complete Gift alias and `gift_comb` list. Omission preserves all current combinations; `[]` removes every Gift. |
+| `giftCombos` | JSON array text | No | Recommended final complete package list. Mutually exclusive with `gifts`; `[]` removes all packages. |
 | `banner` | File | No | Replaces the banner with a non-empty image. The new file is UUID-renamed and uploaded to `banners/Promotions/`. |
 | `termsAction` | Text | No | `keep` (default), `upload`, or `delete`. |
 | `terms` | File | Conditional | Required only when `termsAction=upload`; rejected for `keep` or `delete`. |
@@ -858,8 +937,21 @@ channels = [
 ```
 
 ```json
-gifts = [{"alias":"WATCH BLACK"},{"alias":"ENCO AIR4 WHITE"}]
+gifts = [{"alias":"WATCH BLACK","gift_comb":1},{"alias":"ENCO AIR4 WHITE","gift_comb":1}]
 ```
+
+For both `POST /api/promotions` and `PATCH /api/promotions/{promotionId}`, submit multiple Gift combinations in the existing `gifts` multipart JSON array:
+
+```json
+[
+  { "alias": "WATCH BLACK", "gift_comb": 1 },
+  { "alias": "BUDS WHITE", "gift_comb": 1 },
+  { "alias": "WATCH SILVER", "gift_comb": 2 },
+  { "alias": "BUDS WHITE", "gift_comb": 2 }
+]
+```
+
+Gifts with the same `gift_comb` are an AND package; packages are OR alternatives. Numbers start at `1` and are scoped to one Promotion. Omitted `gift_comb` defaults to `1` for legacy flat inputs. Zero, negative, null, fractional, or nonnumeric values are rejected with `400`. Duplicate `(gift_comb, gift_id)` entries are merged, while the same Gift can appear in different combinations. `giftCount` continues to count distinct Gift IDs across all combinations. The database must allow repeated `(promotion_id, gift_id)` across combinations; use a unique index on `(promotion_id, gift_comb, gift_id)` instead of a two-column uniqueness rule if one exists. Claim creation and Claim Gift edits do not validate combinations.
 
 Relationship replacement rules:
 
@@ -1215,7 +1307,7 @@ Multipart form fields:
 | `receipt` | File | No | Replaces the existing Receipt with a UUID-named JPG, JPEG, PNG, or PDF file up to 5 MB. |
 | `imeiCopy` | File | No | Replaces the existing IMEI-copy image stored through `Claims.screenshot_url`; accepts JPG, JPEG, PNG, or PDF up to 5 MB. |
 
-At least one field or replacement file must be supplied. Gift aliases are resolved to real `Gifts.id` values. For Claims with `promotion_id > 0`, each Gift must belong to that Promotion; for the General Case with `promotion_id = 0`, Promotion-Gift membership is not checked.
+At least one field or replacement file must be supplied. Gift aliases are resolved to real `Gifts.id` values. For Claims with `promotion_id > 0`, each supplied Gift must belong to that Promotion. The endpoint does not validate `gift_comb`, package completeness, or cross-package selections. For the General Case with `promotion_id = 0`, Promotion-Gift membership is not checked.
 
 Replacement files are uploaded to `claims/promotions/{promotionId}/{uuid}.{extension}`. The database continues to store only the UUID filename and extension. Database changes are transactional. A newly uploaded file is removed if the database update fails; after a successful commit, the old corresponding R2 file is deleted. Omitting a file keeps the existing file unchanged.
 
@@ -1324,7 +1416,7 @@ Validation and persistence rules:
 - The Promotion must exist, including the reserved `Promotions.id = 0` row when `promotionId` is `0`.
 - The IMEI must contain exactly 15 digits and exist in `Devices`. Its existing `redemption_status` value is not used to reject the Claim.
 - Device model, channel, and `purchaseDate` are not used to determine Claim eligibility. `purchaseDate` is validated only as `yyyy-MM-dd` and stored in `Claims.purchase_date`.
-- Every Gift alias is resolved to a real `Gifts.id`. For a normal Promotion (`promotionId > 0`), each Gift must also exist in `Promotion_Gifts` for that Promotion. For the General Case (`promotionId = 0`), the `Promotion_Gifts` membership check is skipped, so any existing Gift may be recorded in `Claim_Gifts`.
+- Every Gift alias is resolved to a real `Gifts.id`; unknown aliases return `400`. Any existing Gift may be recorded in `Claim_Gifts`, regardless of `promotionId`. This creation endpoint does not query `Promotion_Gifts` or validate Gift membership, `gift_comb`, package completeness, or cross-package selections. The selected Promotion itself must still exist.
 - A new `Customers` row is inserted first and its generated ID is stored in `Claims.customer_id`.
 - The Claim ID format is `OPNZPROCLM-yyMMdd-XXXXXXXX`, using the current `Pacific/Auckland` date. The final eight characters are cryptographically generated uppercase letters or digits, and the generated ID is checked against `Claims.id` before use.
 - Receipt and screenshot files are independently renamed to UUID filenames while retaining their validated extensions. The backend validates both the extension and the file signature, rejects files larger than 5 MB, and uploads both files concurrently.

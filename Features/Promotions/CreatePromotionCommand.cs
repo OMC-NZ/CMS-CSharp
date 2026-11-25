@@ -17,7 +17,11 @@ internal sealed record PromotionChannelInput(
     string StartDate,
     string EndDate);
 
-internal sealed record PromotionGiftInput(string Alias);
+internal sealed record PromotionGiftInput(
+    string Alias,
+    [property: System.Text.Json.Serialization.JsonPropertyName("gift_comb")] int GiftComb = 1);
+
+internal sealed record PromotionGiftSelection(int GiftId, int GiftComb);
 
 internal sealed record CreatePromotionResult(
     long Id,
